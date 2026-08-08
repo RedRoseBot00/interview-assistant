@@ -16,15 +16,34 @@ from app import config
 
 log = logging.getLogger(__name__)
 
+def _default_model_size() -> str:
+    """
+    Modello proposto alla prima installazione, in base al processore.
+
+    Su un computer con pochi core il modello 'piccolo' non riesce a
+    stare al passo del parlato e la trascrizione accumula ritardo fino
+    a perdere pezzi: meglio partire da uno piu' rapido, l'utente potra'
+    sempre alzarlo dalle impostazioni.
+    """
+    import os
+
+    return "base" if (os.cpu_count() or 2) <= 2 else "small"
+
+
 DEFAULTS: dict[str, Any] = {
     # Trascrizione
-    "whisper_model_size": "small",   # tiny | base | small | medium
+    "whisper_model_size": _default_model_size(),   # tiny | base | small | medium
     "capture_microphone": True,
     "capture_system_audio": True,
     "transcription_language": "auto",  # "auto" oppure codice ISO (it, en, ...)
     # Etichette interlocutori mostrate nella trascrizione
     "label_recruiter": "Tu",
     "label_candidate": "Candidato",
+    # Gestione dell'eco quando non si usano le cuffie:
+    #   "off"    -> nessun intervento
+    #   "auto"   -> riconosce e scarta i blocchi di eco
+    #   "cancel" -> sottrae l'eco dal segnale del microfono
+    "echo_mode": "auto",
     # Report
     "report_language": "auto",
     "auto_generate_report": True,
@@ -46,6 +65,7 @@ DEFAULTS: dict[str, Any] = {
 _ALLOWED: dict[str, tuple] = {
     "whisper_model_size": config.WHISPER_MODEL_SIZES,
     "cpu_mode": ("auto", "compatible", "fast"),
+    "echo_mode": ("off", "auto", "cancel"),
     "engine_selftest": ("", "ok", "ok-compatible", "failed"),
 }
 
