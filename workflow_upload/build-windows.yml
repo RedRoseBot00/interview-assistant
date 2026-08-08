@@ -1,0 +1,49 @@
+name: Build Windows installer
+
+# Questo workflow compila automaticamente l'app su una macchina Windows
+# fornita gratuitamente da GitHub (nessun PC Windows necessario) e
+# produce il file InterviewAssistantSetup.exe pronto da consegnare al
+# cliente. Si avvia manualmente dalla scheda "Actions" del repository
+# (pulsante "Run workflow"), oppure automaticamente a ogni push.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Scarica il codice del progetto
+        uses: actions/checkout@v4
+
+      - name: Configura Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: "x64"
+
+      - name: Installa le dipendenze
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compila l'applicazione (PyInstaller)
+        run: pyinstaller build/app.spec --noconfirm
+
+      - name: Installa Inno Setup
+        run: choco install innosetup -y
+
+      - name: Crea l'installer .exe
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" build\installer.iss
+
+      - name: Carica l'installer come risultato della build
+        uses: actions/upload-artifact@v4
+        with:
+          name: InterviewAssistantSetup
+          path: build/Output/InterviewAssistantSetup.exe
+          if-no-files-found: error
