@@ -14,7 +14,7 @@ from pathlib import Path
 
 block_cipher = None
 
-project_root = Path(__file__).resolve().parent.parent
+project_root = Path(SPECPATH).resolve().parent
 
 a = Analysis(
     [str(project_root / "run.py")],
