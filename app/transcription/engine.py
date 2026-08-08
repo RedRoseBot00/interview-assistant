@@ -1,158 +1,334 @@
 """
-Motore di trascrizione live basato su faster-whisper (Whisper locale,
-CTranslate2), completamente offline e gratuito.
+Motore di trascrizione in tempo reale.
 
-Whisper riconosce automaticamente ~99 lingue: non serve configurare nulla
-per supportare colloqui in italiano, inglese o qualunque altra lingua.
+Basato su faster-whisper (Whisper eseguito da CTranslate2): gira in
+locale, senza connessione e senza costi, e riconosce automaticamente
+circa 99 lingue, quindi il colloquio puo' svolgersi in italiano,
+inglese o qualunque altra lingua senza configurare nulla.
+
+Il motore consuma i blocchi audio gia' etichettati per interlocutore
+prodotti da app.audio.capture e restituisce frasi attribuite a "Tu"
+(microfono) o al "Candidato" (audio della videochiamata).
 """
 from __future__ import annotations
 
+import logging
+import queue
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import Callable, Optional
 
 import numpy as np
 
 from app import config
+from app.audio.capture import AudioChunk, rms_level
+
+log = logging.getLogger(__name__)
+
+# Oltre questo intervallo fra due blocchi della stessa persona il
+# contesto precedente non serve piu' a togliere le ripetizioni: due
+# frasi identiche pronunciate a distanza sono due frasi diverse.
+CONTEXT_EXPIRY_SECONDS = config.TRANSCRIBE_CHUNK_SECONDS * 2.5
 
 
 @dataclass
 class TranscriptSegment:
+    speaker: str                     # config.SPEAKER_RECRUITER | SPEAKER_CANDIDATE
     text: str
-    language: str
-    start_offset: float  # secondi dall'inizio del colloquio
+    language: str = ""
+    offset_seconds: float = 0.0      # secondi dall'inizio del colloquio
     timestamp: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict:
+        return {
+            "speaker": self.speaker,
+            "text": self.text,
+            "language": self.language,
+            "offset_seconds": round(self.offset_seconds, 2),
+        }
+
+
+def _normalise(word: str) -> str:
+    return word.strip(".,;:!?'\"()").lower()
+
+
+def _strip_overlap(previous: str, current: str, max_words: int = 8) -> str:
+    """
+    Rimuove la ripetizione dovuta alla sovrapposizione tra blocchi.
+
+    I blocchi audio si sovrappongono di qualche decimo di secondo per
+    non troncare le parole a meta', quindi l'inizio di una trascrizione
+    puo' ripetere la fine della precedente. Qui cerchiamo la piu' lunga
+    coda di 'previous' che coincide con la testa di 'current' e la
+    togliamo.
+
+    Due accorgimenti: la sovrapposizione tipica e' di una o due parole,
+    quindi va considerato anche il caso di una sola parola (purche' non
+    sia una parolina breve, che si ripete spesso in modo legittimo); e
+    non si scarta mai l'intera frase, altrimenti una risposta ripetuta
+    ("Perfetto." detto due volte) sparirebbe dalla trascrizione.
+    """
+    if not previous or not current:
+        return current
+
+    prev_words = previous.split()
+    curr_words = current.split()
+    limit = min(max_words, len(prev_words), len(curr_words))
+
+    for size in range(limit, 0, -1):
+        if size >= len(curr_words):
+            continue  # non consumare l'intera frase
+        tail = [_normalise(w) for w in prev_words[-size:]]
+        head = [_normalise(w) for w in curr_words[:size]]
+        if tail != head:
+            continue
+        if size == 1 and len(tail[0]) < 4:
+            continue  # "e", "che", "ok": ripetizioni legittime
+        return " ".join(curr_words[size:]).strip()
+    return current
 
 
 class TranscriptionEngine:
-    """
-    Consuma i chunk audio prodotti da AudioRecorder e produce testo via
-    faster-whisper, in un thread dedicato in modo da non bloccare la UI.
-    """
+    """Trascrive i blocchi audio in un thread dedicato."""
 
     def __init__(
         self,
         model_size: str = config.WHISPER_MODEL_SIZE_DEFAULT,
+        language: str = "auto",
         on_segment: Optional[Callable[[TranscriptSegment], None]] = None,
-        on_ready: Optional[Callable[[], None]] = None,
+        on_status: Optional[Callable[[str], None]] = None,
         on_error: Optional[Callable[[Exception], None]] = None,
     ):
         self.model_size = model_size
+        self.language = language
         self.on_segment = on_segment
-        self.on_ready = on_ready
+        self.on_status = on_status
         self.on_error = on_error
 
         self._model = None
-        self._running = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._elapsed = 0.0
-        self.segments: List[TranscriptSegment] = []
+        self._stop = threading.Event()
+        self._use_vad = True
 
-        # Buffer di accumulo per finestre di trascrizione con overlap,
-        # cosi' non tagliamo le parole a meta' frase.
-        self._pending = np.zeros(0, dtype=np.float32)
-        self._pending_lock = threading.Lock()
+        self.segments: list[TranscriptSegment] = []
+        self.backlog = 0
+
+        self._languages: Counter[str] = Counter()
+        self._last_text: dict[str, str] = {}
+        self._last_offset: dict[str, float] = {}
+        self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
-    def load_model(self):
-        """Carica il modello Whisper in memoria (operazione lenta, va
-        eseguita in un thread separato dalla UI al primo avvio)."""
+    def load_model(self) -> None:
+        """Carica il modello in memoria. Operazione lenta: mai dal thread grafico."""
         from faster_whisper import WhisperModel
 
+        from app.models.download import whisper_model_dir, whisper_model_present
+
+        if not whisper_model_present(self.model_size):
+            raise RuntimeError(
+                f"Il modello di trascrizione '{self.model_size}' non e' installato. "
+                "Riavvia l'applicazione per completarne il download."
+            )
+
+        self._notify_status("Caricamento del modello di trascrizione...")
+        started = time.monotonic()
         self._model = WhisperModel(
-            self.model_size,
+            str(whisper_model_dir(self.model_size)),
             device="cpu",
             compute_type=config.WHISPER_COMPUTE_TYPE,
-            download_root=str(config.WHISPER_CACHE_DIR),
         )
-        if self.on_ready:
-            self.on_ready()
+        log.info(
+            "Modello '%s' caricato in %.1f s",
+            self.model_size,
+            time.monotonic() - started,
+        )
 
     # ------------------------------------------------------------------
-    def feed(self, samples: np.ndarray):
-        """Chiamato dal thread di cattura audio per ogni chunk mixato."""
-        with self._pending_lock:
-            self._pending = np.concatenate([self._pending, samples])
-
-    def start(self, audio_queue):
-        """Avvia il loop di trascrizione, leggendo chunk da audio_queue
-        (una queue.Queue popolata da AudioRecorder)."""
-        self._running.set()
+    def start(self, audio_queue: "queue.Queue[AudioChunk]") -> None:
+        self._stop.clear()
         self._thread = threading.Thread(
-            target=self._run_loop, args=(audio_queue,), daemon=True
+            target=self._run, args=(audio_queue,), name="transcription", daemon=True
         )
         self._thread.start()
 
-    def stop(self):
-        self._running.clear()
-        if self._thread:
-            self._thread.join(timeout=5)
+    def stop(self, timeout: float = 25.0) -> bool:
+        """
+        Ferma il motore lasciandogli il tempo di smaltire la coda: le
+        ultime frasi del colloquio devono comparire nel report.
+
+        Restituisce True solo se il thread e' davvero terminato: chi
+        chiama deve saperlo, perche' un thread ancora vivo continua a
+        scrivere nella lista dei segmenti.
+        """
+        self._stop.set()
+        thread = self._thread
+        if thread is None:
+            return True
+
+        thread.join(timeout=timeout)
+        if thread.is_alive():
+            log.warning(
+                "Trascrizione ancora in corso dopo %.0f s (%d blocchi arretrati): "
+                "attendo ancora.",
+                timeout,
+                self.backlog,
+            )
+            self._notify_status(
+                f"Completamento della trascrizione: {self.backlog} blocchi rimasti..."
+            )
+            thread.join(timeout=timeout)
+
+        if thread.is_alive():
+            log.error("Il thread di trascrizione non si e' fermato")
+            return False
+
+        self._thread = None
+        return True
 
     # ------------------------------------------------------------------
-    def _run_loop(self, audio_queue):
-        if self._model is None:
+    def _notify_status(self, message: str) -> None:
+        if self.on_status:
             try:
-                self.load_model()
-            except Exception as exc:
-                if self.on_error:
-                    self.on_error(exc)
-                return
-
-        chunk_samples = int(
-            config.TRANSCRIBE_CHUNK_SECONDS * config.AUDIO_SAMPLE_RATE
-        )
-        overlap_samples = int(
-            config.TRANSCRIBE_OVERLAP_SECONDS * config.AUDIO_SAMPLE_RATE
-        )
-
-        while self._running.is_set():
-            try:
-                samples = audio_queue.get(timeout=0.5)
+                self.on_status(message)
             except Exception:
-                continue
+                log.debug("Notifica di stato fallita", exc_info=True)
 
-            with self._pending_lock:
-                self._pending = np.concatenate([self._pending, samples])
-                ready = self._pending.size >= chunk_samples
-
-            if not ready:
-                continue
-
-            with self._pending_lock:
-                window = self._pending[:chunk_samples]
-                # manteniamo l'overlap per la finestra successiva
-                self._pending = self._pending[chunk_samples - overlap_samples:]
-
-            self._transcribe_window(window)
-
-    def _transcribe_window(self, window: np.ndarray):
-        if window.size == 0 or self._model is None:
-            return
+    def _run(self, audio_queue: "queue.Queue[AudioChunk]") -> None:
         try:
-            segments, info = self._model.transcribe(
-                window,
-                language=None,  # autodetect: supporto multilingua
-                vad_filter=True,  # filtra i silenzi, riduce le allucinazioni
-                beam_size=1,
-            )
-            text = " ".join(seg.text.strip() for seg in segments).strip()
-            if not text:
-                return
-            segment = TranscriptSegment(
-                text=text,
-                language=info.language,
-                start_offset=self._elapsed,
-            )
-            self.segments.append(segment)
-            if self.on_segment:
-                self.on_segment(segment)
+            if self._model is None:
+                self.load_model()
+            self._notify_status("In ascolto")
         except Exception as exc:
+            log.exception("Caricamento del modello non riuscito")
             if self.on_error:
                 self.on_error(exc)
-        finally:
-            self._elapsed += config.TRANSCRIBE_CHUNK_SECONDS
+            # Svuotiamo comunque la coda: senza consumatore i thread
+            # audio la riempirebbero fino a scartare blocchi a vuoto.
+            self._drain(audio_queue)
+            return
+
+        while True:
+            try:
+                chunk = audio_queue.get(timeout=0.4)
+            except queue.Empty:
+                if self._stop.is_set():
+                    break
+                continue
+
+            self.backlog = audio_queue.qsize()
+            try:
+                self._process(chunk)
+            except Exception as exc:
+                log.exception("Errore durante la trascrizione di un blocco")
+                if self.on_error:
+                    self.on_error(exc)
+
+        self._notify_status("Trascrizione conclusa")
+
+    @staticmethod
+    def _drain(audio_queue: "queue.Queue[AudioChunk]") -> None:
+        try:
+            while True:
+                audio_queue.get_nowait()
+        except queue.Empty:
+            pass
+
+    def _process(self, chunk: AudioChunk) -> None:
+        if chunk.samples.size == 0 or self._model is None:
+            return
+
+        # Il silenzio costituisce gran parte di un colloquio: scartarlo
+        # subito risparmia CPU e riduce le "allucinazioni" del modello,
+        # che sull'audio muto tende a inventare frasi.
+        if rms_level(chunk.samples) < config.SILENCE_RMS_THRESHOLD:
+            return
+
+        audio = np.asarray(chunk.samples, dtype=np.float32)
+        language = None if self.language == "auto" else self.language
+
+        try:
+            segments, info = self._model.transcribe(
+                audio,
+                language=language,
+                beam_size=1,
+                vad_filter=self._use_vad,
+                condition_on_previous_text=False,
+            )
+            parts = [seg.text.strip() for seg in segments]
+        except Exception as exc:
+            # Il filtro di rilevamento voce richiede una libreria
+            # aggiuntiva: se manca, proseguiamo senza, invece di
+            # interrompere un colloquio in corso.
+            if not self._use_vad:
+                raise
+            log.warning("Filtro voce non disponibile, proseguo senza: %s", exc)
+            self._use_vad = False
+            segments, info = self._model.transcribe(
+                audio,
+                language=language,
+                beam_size=1,
+                vad_filter=False,
+                condition_on_previous_text=False,
+            )
+            parts = [seg.text.strip() for seg in segments]
+
+        text = " ".join(part for part in parts if part).strip()
+        if not text:
+            return
+
+        detected = getattr(info, "language", "") or ""
+
+        with self._lock:
+            previous = self._last_text.get(chunk.speaker, "")
+            if chunk.offset - self._last_offset.get(chunk.speaker, -999.0) > CONTEXT_EXPIRY_SECONDS:
+                previous = ""
+            text = _strip_overlap(previous, text)
+            if not text:
+                return
+
+            self._last_text[chunk.speaker] = text
+            self._last_offset[chunk.speaker] = chunk.offset
+            if detected:
+                self._languages[detected] += 1
+
+            segment = TranscriptSegment(
+                speaker=chunk.speaker,
+                text=text,
+                language=detected,
+                offset_seconds=max(0.0, chunk.offset),
+                timestamp=chunk.wall_time,
+            )
+            self.segments.append(segment)
+
+        if self.on_segment:
+            self.on_segment(segment)
 
     # ------------------------------------------------------------------
-    def full_transcript(self) -> str:
-        return "\n".join(s.text for s in self.segments)
+    @property
+    def detected_language(self) -> str:
+        """
+        Lingua prevalente del colloquio.
+
+        Non ci si puo' basare sul primo blocco riconosciuto: spesso e'
+        un "mmm" o un "ok" che Whisper attribuisce a una lingua a caso.
+        """
+        with self._lock:
+            if not self._languages:
+                return ""
+            return self._languages.most_common(1)[0][0]
+
+    def transcript_lines(self, labels: dict[str, str]) -> list[str]:
+        with self._lock:
+            return [
+                f"{labels.get(s.speaker, s.speaker)}: {s.text}" for s in self.segments
+            ]
+
+    def full_transcript(self, labels: dict[str, str]) -> str:
+        return "\n".join(self.transcript_lines(labels))
+
+    def segments_as_dicts(self) -> list[dict]:
+        with self._lock:
+            return [s.to_dict() for s in self.segments]

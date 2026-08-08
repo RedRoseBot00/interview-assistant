@@ -1,23 +1,43 @@
+# Indice ufficiale delle versioni gia' compilate (CPU) di llama-cpp-python.
+# Su PyPI esiste solo il codice sorgente: senza questa riga pip proverebbe a
+# compilare llama.cpp con Visual Studio, cosa che fa fallire la build.
+--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+
 # Interfaccia grafica
 PySide6==6.7.2
 
-# Trascrizione vocale locale (Whisper via CTranslate2), multilingua
+# Trascrizione vocale locale (Whisper eseguito da CTranslate2)
 faster-whisper==1.0.3
 
-# LLM locale per generazione report (no API, no costi)
+# Dipendenze diritte di faster-whisper, fissate esplicitamente: una build
+# ripetibile non deve dipendere da quale versione si trova su internet oggi.
+ctranslate2==4.4.0
+av==12.3.0
+tokenizers==0.19.1
+huggingface-hub==0.24.6
+tqdm==4.66.5
+
+# Rilevamento della voce, usato per scartare i silenzi
+onnxruntime==1.18.1
+
+# Modello linguistico locale per i report (nessuna API, nessun costo)
 llama-cpp-python==0.2.90
 
-# Cattura audio microfono + loopback di sistema (solo Windows)
+# Cattura microfono e audio di sistema (loopback WASAPI, solo Windows)
 PyAudioWPatch==0.2.12.7 ; sys_platform == "win32"
 
-# Calcolo numerico (resampling audio)
+# Calcolo numerico sui campioni audio
 numpy==1.26.4
 
-# Download modelli
+# Download dei modelli al primo avvio
 requests==2.32.3
 
-# Export report in formato Word
+# Rilevamento delle applicazioni di videochiamata in esecuzione
+psutil==6.0.0
+
+# Esportazione del report in formato Word
 python-docx==1.1.2
 
-# Packaging in eseguibile Windows
+# Creazione dell'eseguibile Windows
 pyinstaller==6.10.0
+pyinstaller-hooks-contrib==2024.8

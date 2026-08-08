@@ -1,0 +1,78 @@
+name: Build Windows installer
+
+# Compila l'applicazione su una macchina Windows fornita gratuitamente
+# da GitHub e produce InterviewAssistantSetup.exe, il file da consegnare
+# al cliente. Si avvia da solo a ogni modifica del codice, oppure
+# manualmente dalla scheda "Actions" (pulsante "Run workflow").
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Scarica il codice del progetto
+        uses: actions/checkout@v4
+
+      - name: Configura Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: "x64"
+          cache: "pip"
+
+      - name: Installa le dipendenze
+        # --only-binary per llama-cpp-python: se la versione gia'
+        # compilata non fosse disponibile vogliamo un errore immediato,
+        # non mezz'ora di compilazione destinata a fallire.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt --only-binary=llama-cpp-python
+
+      - name: Compila l'applicazione (PyInstaller)
+        run: pyinstaller build/app.spec --noconfirm --clean
+
+      - name: Verifica che l'eseguibile compilato funzioni
+        # Controlla che tutte le librerie native siano finite nel
+        # pacchetto: senza questo passaggio una libreria mancante si
+        # scoprirebbe solo sul computer del cliente.
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist\InterviewAssistant\InterviewAssistant.exe" `
+                             -ArgumentList "--smoke-test" -Wait -PassThru
+          $logs = "$env:APPDATA\InterviewAssistant\logs"
+          if (Test-Path $logs) {
+            Get-ChildItem $logs -Filter *.log | ForEach-Object { Get-Content $_.FullName }
+          }
+          if ($p.ExitCode -ne 0) { throw "Verifica del pacchetto fallita (codice $($p.ExitCode))" }
+
+      - name: Installa Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Crea l'installer .exe
+        shell: pwsh
+        run: |
+          $iscc = Get-ChildItem "C:\Program Files (x86)\Inno Setup *\ISCC.exe" | Select-Object -First 1
+          if (-not $iscc) { throw "ISCC.exe non trovato" }
+          & $iscc.FullName build\installer.iss
+
+      - name: Carica l'installer come risultato della build
+        uses: actions/upload-artifact@v4
+        with:
+          name: InterviewAssistantSetup
+          path: build/Output/InterviewAssistantSetup.exe
+          if-no-files-found: error
+
+      - name: Carica i log in caso di problemi
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostica
+          path: |
+            build/
+            dist/InterviewAssistant/*.txt
+          if-no-files-found: ignore
