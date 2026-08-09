@@ -5,10 +5,27 @@ name: Build Windows installer
 # al cliente. Si avvia da solo a ogni modifica del codice, oppure
 # manualmente dalla scheda "Actions" (pulsante "Run workflow").
 
+# La compilazione si avvia SOLO a comando, dalla scheda "Actions" con il
+# pulsante "Run workflow".
+#
+# Prima partiva a ogni modifica del codice. Sembrava comodo, ma i file
+# di un aggiornamento si caricano una cartella per volta — GitHub non
+# accetta una cartella intera in un colpo solo — e ogni caricamento
+# faceva partire una compilazione a se': l'elenco si riempiva di dieci
+# voci per ogni versione, tutte incomplete tranne l'ultima, e ognuna
+# produceva un installer con lo stesso nome di quello buono. Il rischio
+# concreto era scaricare e installare una versione a meta'.
+#
+# Adesso si caricano tutti i file, poi si preme "Run workflow" una volta
+# sola: una compilazione, un installer, nessuna ambiguita'.
 on:
   workflow_dispatch:
-  push:
-    branches: [ main, master ]
+
+# Una compilazione per volta: se ne viene lanciata un'altra, quella in
+# corso viene interrotta invece di produrre un secondo installer.
+concurrency:
+  group: build-windows
+  cancel-in-progress: true
 
 jobs:
   build:
