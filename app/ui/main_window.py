@@ -1,13 +1,11 @@
 """
 Finestra principale dell'applicazione.
 
-Impostazione a tre colonne, pensata per stare accanto alla finestra
-della videochiamata:
-
-  * a sinistra la trascrizione dal vivo, con le battute attribuite a chi
-    le pronuncia;
-  * al centro lo stato della registrazione e il report generato;
-  * a destra la scheda del candidato e le note del selezionatore.
+La schermata del colloquio segue lo schema richiesto: a sinistra la
+trascrizione dal vivo, al centro la videochiamata, a destra la scheda
+del candidato con le note. Tutto il resto (report, archivio,
+impostazioni) sta in schede separate, per non affollare la vista che
+si usa mentre si parla con la persona.
 """
 from __future__ import annotations
 
@@ -41,39 +39,42 @@ from PySide6.QtWidgets import (
 )
 
 from app import compat, config, platform_detect, settings
+from app.audio import echo as echo_module
 from app.export.report import export_docx, export_txt
 from app.storage import db
 from app.ui import theme
+from app.ui.call_view import CallView, best_call_window, list_windows
 from app.ui.session import InterviewSession
 from app.ui.theme import Card, Chip, LevelMeter, StatusDot
 from app.ui.workers import PlatformProbe, ReportWorker, StartupWorker
 
 log = logging.getLogger(__name__)
 
+TAB_INTERVIEW = 0
+TAB_REPORT = 1
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"{config.APP_DISPLAY_NAME} — assistente per colloqui")
-        self.resize(1360, 840)
-        self.setMinimumSize(1100, 700)
+        self.resize(1440, 880)
+        self.setMinimumSize(1150, 720)
 
         self.session: InterviewSession | None = None
         self.startup_worker: StartupWorker | None = None
         self.report_worker: ReportWorker | None = None
         self.platform_probe: PlatformProbe | None = None
 
-        # Qt distrugge l'oggetto C++ di un QThread quando l'ultimo
-        # riferimento Python sparisce. Se accadesse mentre il thread e'
-        # in esecuzione, il programma verrebbe chiuso all'istante: qui
-        # teniamo in vita i worker finche' non hanno finito davvero.
+        # Qt distrugge l'oggetto interno di un thread quando l'ultimo
+        # riferimento sparisce: se accadesse mentre e' in esecuzione, il
+        # programma verrebbe chiuso all'istante.
         self._live_workers: set = set()
 
         self.is_recording = False
         self.engine_ready = False
         self.closing = False
         self.current_interview_id: int | None = None
-        self.current_report_used_llm = False
         self._pending: dict = {}
         self._warnings: list[str] = []
 
@@ -89,8 +90,10 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
         self.tabs.addTab(self._build_interview_tab(), "Colloquio")
+        self.tabs.addTab(self._build_report_tab(), "Report")
         self.tabs.addTab(self._build_history_tab(), "Storico")
         self.tabs.addTab(self._build_settings_tab(), "Impostazioni")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         layout.addWidget(self.tabs, 1)
 
         self.setCentralWidget(central)
@@ -106,6 +109,7 @@ class MainWindow(QMainWindow):
         self._refresh_platform()
         self._refresh_history()
         self._apply_always_on_top(settings.get("always_on_top", False))
+        QTimer.singleShot(600, self._auto_select_call_window)
         self._start_preparation()
 
     # ==================================================================
@@ -145,6 +149,11 @@ class MainWindow(QMainWindow):
             row.addWidget(Chip(label))
         row.addStretch(1)
 
+        self.echo_chip = QLabel("")
+        self.echo_chip.setProperty("class", "Chip")
+        self.echo_chip.setVisible(False)
+        row.addWidget(self.echo_chip)
+
         self.platform_dot = StatusDot(theme.TEXT_MUTED, 9)
         row.addWidget(self.platform_dot)
         self.platform_label = QLabel("Rilevamento in corso...")
@@ -158,8 +167,8 @@ class MainWindow(QMainWindow):
     def _build_interview_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(18, 16, 18, 16)
-        layout.setSpacing(12)
+        layout.setContentsMargins(18, 14, 18, 16)
+        layout.setSpacing(10)
 
         layout.addLayout(self._build_toolbar())
         layout.addWidget(self._build_status_strip())
@@ -167,9 +176,9 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Horizontal)
         splitter.setChildrenCollapsible(False)
         splitter.addWidget(self._build_transcript_card())
-        splitter.addWidget(self._build_center_column())
-        splitter.addWidget(self._build_side_column())
-        splitter.setSizes([440, 480, 340])
+        splitter.addWidget(self._build_call_card())
+        splitter.addWidget(self._build_candidate_column())
+        splitter.setSizes([400, 620, 360])
         layout.addWidget(splitter, 1)
         return page
 
@@ -182,12 +191,6 @@ class MainWindow(QMainWindow):
         self.record_button.setEnabled(False)
         self.record_button.clicked.connect(self._toggle_recording)
         row.addWidget(self.record_button)
-
-        self.report_button = QPushButton("Genera report")
-        self.report_button.setObjectName("AccentButton")
-        self.report_button.setEnabled(False)
-        self.report_button.clicked.connect(self._generate_report)
-        row.addWidget(self.report_button)
 
         self.captions_button = QPushButton("Sottotitoli live: attivi")
         self.captions_button.setCheckable(True)
@@ -203,6 +206,34 @@ class MainWindow(QMainWindow):
 
         row.addStretch(1)
 
+        # Indicatori di livello compatti: rispondono alla domanda piu'
+        # frequente durante una registrazione, "mi sta sentendo?".
+        self.level_meters: dict[str, LevelMeter] = {}
+        self.source_labels: dict[str, QLabel] = {}
+        for speaker, fallback in (
+            (config.SPEAKER_RECRUITER, "Tu"),
+            (config.SPEAKER_CANDIDATE, "Candidato"),
+        ):
+            name = QLabel(
+                settings.get(
+                    "label_recruiter"
+                    if speaker == config.SPEAKER_RECRUITER
+                    else "label_candidate",
+                    fallback,
+                )
+            )
+            theme.bold(name)
+            name.setStyleSheet(f"color: {theme.SPEAKER_COLORS[speaker]};")
+            name.setToolTip("Sorgente audio non ancora attiva")
+            self.source_labels[speaker] = name
+            row.addWidget(name)
+
+            meter = LevelMeter(theme.SPEAKER_COLORS[speaker])
+            meter.setFixedWidth(90)
+            self.level_meters[speaker] = meter
+            row.addWidget(meter)
+
+        row.addSpacing(10)
         self.recording_dot = StatusDot(theme.TEXT_MUTED, 11)
         row.addWidget(self.recording_dot)
         self.timer_label = QLabel("00:00")
@@ -214,7 +245,7 @@ class MainWindow(QMainWindow):
         container = QFrame()
         container.setProperty("class", "Card")
         layout = QVBoxLayout(container)
-        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setContentsMargins(14, 9, 14, 9)
         layout.setSpacing(6)
 
         self.status_label = QLabel("Preparazione in corso...")
@@ -236,14 +267,18 @@ class MainWindow(QMainWindow):
 
         legend = QHBoxLayout()
         legend.setSpacing(14)
-        for speaker, name in (
-            (config.SPEAKER_RECRUITER, settings.get("label_recruiter", "Tu")),
-            (config.SPEAKER_CANDIDATE, settings.get("label_candidate", "Candidato")),
+        for speaker, fallback in (
+            (config.SPEAKER_RECRUITER, "Tu"),
+            (config.SPEAKER_CANDIDATE, "Candidato"),
         ):
-            dot = StatusDot(theme.SPEAKER_COLORS[speaker], 9)
-            label = QLabel(name)
+            key = (
+                "label_recruiter"
+                if speaker == config.SPEAKER_RECRUITER
+                else "label_candidate"
+            )
+            legend.addWidget(StatusDot(theme.SPEAKER_COLORS[speaker], 9))
+            label = QLabel(settings.get(key, fallback))
             label.setProperty("class", "Muted")
-            legend.addWidget(dot)
             legend.addWidget(label)
         legend.addStretch(1)
         card.body().addLayout(legend)
@@ -251,90 +286,41 @@ class MainWindow(QMainWindow):
         self.transcript_view = QTextEdit()
         self.transcript_view.setReadOnly(True)
         self.transcript_view.setPlaceholderText(
-            "La trascrizione comparira' qui, riga per riga, mentre il colloquio "
-            "prosegue."
+            "La trascrizione comparira' qui, riga per riga, mentre il "
+            "colloquio prosegue."
         )
         card.add(self.transcript_view, 1)
         return card
 
-    def _build_center_column(self) -> QWidget:
-        column = QWidget()
-        layout = QVBoxLayout(column)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
+    def _build_call_card(self) -> QWidget:
+        card = Card("Videochiamata")
 
-        audio_card = Card("Audio in ingresso")
-        self.level_meters: dict[str, LevelMeter] = {}
-        self.source_labels: dict[str, QLabel] = {}
-        for speaker, default_name in (
-            (config.SPEAKER_RECRUITER, "Microfono"),
-            (config.SPEAKER_CANDIDATE, "Audio della videochiamata"),
-        ):
-            row = QHBoxLayout()
-            row.setSpacing(10)
+        picker = QHBoxLayout()
+        picker.setSpacing(8)
+        self.window_combo = QComboBox()
+        self.window_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.window_combo.activated.connect(self._on_window_selected)
+        picker.addWidget(self.window_combo, 1)
 
-            name = QLabel(
-                settings.get(
-                    "label_recruiter" if speaker == config.SPEAKER_RECRUITER
-                    else "label_candidate",
-                    default_name,
-                )
-            )
-            name.setFixedWidth(78)
-            theme.bold(name)
-            name.setStyleSheet(f"color: {theme.SPEAKER_COLORS[speaker]};")
-            row.addWidget(name)
+        refresh_button = QPushButton("Aggiorna")
+        refresh_button.setToolTip("Rileggi l'elenco delle finestre aperte")
+        refresh_button.clicked.connect(lambda: self._refresh_window_list(True))
+        picker.addWidget(refresh_button)
+        card.body().addLayout(picker)
 
-            meter = LevelMeter(theme.SPEAKER_COLORS[speaker])
-            meter.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            self.level_meters[speaker] = meter
-            row.addWidget(meter, 1)
-
-            device = QLabel("non attivo")
-            device.setProperty("class", "Muted")
-            device.setMinimumWidth(150)
-            device.setMaximumWidth(240)
-            self.source_labels[speaker] = device
-            row.addWidget(device)
-
-            audio_card.body().addLayout(row)
+        self.call_view = CallView()
+        card.add(self.call_view, 1)
 
         hint = QLabel(
-            "La voce del candidato viene letta dall'audio in uscita del "
-            "computer: funziona con Teams, Zoom, Meet e qualsiasi altra "
-            "piattaforma, senza installare nulla nella videochiamata."
+            "L'anteprima e' solo visiva: per parlare, condividere lo schermo o "
+            "riagganciare usa la finestra originale della videochiamata."
         )
         hint.setWordWrap(True)
         hint.setProperty("class", "Muted")
-        audio_card.add(hint)
-        layout.addWidget(audio_card)
+        card.add(hint)
+        return card
 
-        report_card = Card("Report del colloquio")
-        self.report_view = QTextEdit()
-        self.report_view.setReadOnly(True)
-        self.report_view.setPlaceholderText(
-            "Al termine del colloquio qui comparira' il report generato "
-            "dall'intelligenza artificiale locale: sintesi, punti di forza, "
-            "aree di attenzione e domande di approfondimento."
-        )
-        report_card.add(self.report_view, 1)
-
-        export_row = QHBoxLayout()
-        export_row.setSpacing(10)
-        self.export_docx_button = QPushButton("Esporta Word")
-        self.export_docx_button.clicked.connect(lambda: self._export("docx"))
-        self.export_txt_button = QPushButton("Esporta testo")
-        self.export_txt_button.clicked.connect(lambda: self._export("txt"))
-        for button in (self.export_docx_button, self.export_txt_button):
-            button.setEnabled(False)
-            export_row.addWidget(button)
-        export_row.addStretch(1)
-        report_card.body().addLayout(export_row)
-
-        layout.addWidget(report_card, 1)
-        return column
-
-    def _build_side_column(self) -> QWidget:
+    def _build_candidate_column(self) -> QWidget:
         column = QWidget()
         layout = QVBoxLayout(column)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -376,12 +362,52 @@ class MainWindow(QMainWindow):
 
         self.notes_edit = QTextEdit()
         self.notes_edit.setPlaceholderText(
-            "Appunti personali durante il colloquio.\n"
-            "Vengono salvati insieme alla trascrizione ed esportati nel report."
+            "Appunti durante il colloquio.\n"
+            "Vengono salvati insieme alla trascrizione e finiscono nel report."
         )
         notes_card.add(self.notes_edit, 1)
         layout.addWidget(notes_card, 1)
         return column
+
+    # ==================================================================
+    # Scheda "Report"
+    # ==================================================================
+    def _build_report_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(12)
+
+        card = Card("Report del colloquio")
+        self.report_view = QTextEdit()
+        self.report_view.setReadOnly(True)
+        self.report_view.setPlaceholderText(
+            "Al termine del colloquio qui comparira' il report generato "
+            "dall'intelligenza artificiale locale: sintesi, punti di forza, "
+            "aree di attenzione, competenze citate e domande di approfondimento."
+        )
+        card.add(self.report_view, 1)
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(10)
+        self.report_button = QPushButton("Genera report")
+        self.report_button.setObjectName("AccentButton")
+        self.report_button.setEnabled(False)
+        self.report_button.clicked.connect(self._generate_report)
+        buttons.addWidget(self.report_button)
+
+        self.export_docx_button = QPushButton("Esporta Word")
+        self.export_docx_button.clicked.connect(lambda: self._export("docx"))
+        self.export_txt_button = QPushButton("Esporta testo")
+        self.export_txt_button.clicked.connect(lambda: self._export("txt"))
+        for button in (self.export_docx_button, self.export_txt_button):
+            button.setEnabled(False)
+            buttons.addWidget(button)
+        buttons.addStretch(1)
+        card.body().addLayout(buttons)
+
+        layout.addWidget(card, 1)
+        return page
 
     # ==================================================================
     # Scheda "Storico"
@@ -427,20 +453,19 @@ class MainWindow(QMainWindow):
         outer.setContentsMargins(18, 16, 18, 16)
         outer.setSpacing(12)
 
-        left = Card("Trascrizione")
+        left = Card("Audio e trascrizione")
         self.model_combo = QComboBox()
         for size in config.WHISPER_MODEL_SIZES:
             self.model_combo.addItem(
                 {
                     "tiny": "Minimo — velocissimo, meno preciso",
-                    "base": "Base — veloce",
-                    "small": "Piccolo — consigliato",
-                    "medium": "Medio — piu' preciso, richiede un buon processore",
+                    "base": "Base — veloce, consigliato su PC modesti",
+                    "small": "Piccolo — piu' preciso, richiede 4 core o piu'",
+                    "medium": "Medio — molto preciso, solo su PC potenti",
                 }[size],
                 size,
             )
-        current = settings.get("whisper_model_size", "small")
-        index = self.model_combo.findData(current)
+        index = self.model_combo.findData(settings.get("whisper_model_size", "small"))
         self.model_combo.setCurrentIndex(max(0, index))
 
         self.language_combo = QComboBox()
@@ -450,19 +475,37 @@ class MainWindow(QMainWindow):
             ("fr", "Francese"), ("de", "Tedesco"), ("pt", "Portoghese"),
         ):
             self.language_combo.addItem(name, code)
-        index = self.language_combo.findData(settings.get("transcription_language", "auto"))
+        index = self.language_combo.findData(
+            settings.get("transcription_language", "auto")
+        )
         self.language_combo.setCurrentIndex(max(0, index))
+
+        self.echo_combo = QComboBox()
+        self.echo_combo.addItem(
+            "Disattivata — corretta se si usano le cuffie", echo_module.MODE_OFF
+        )
+        self.echo_combo.addItem(
+            "Automatica — scarta l'eco degli altoparlanti (consigliata)",
+            echo_module.MODE_AUTO,
+        )
+        self.echo_combo.addItem(
+            "Avanzata — cancella l'eco e conserva le sovrapposizioni di voce",
+            echo_module.MODE_CANCEL,
+        )
+        index = self.echo_combo.findData(settings.get("echo_mode", echo_module.MODE_AUTO))
+        self.echo_combo.setCurrentIndex(max(0, index))
 
         self.mic_check = QCheckBox("Registra il microfono (la tua voce)")
         self.mic_check.setChecked(bool(settings.get("capture_microphone", True)))
         self.system_check = QCheckBox(
-            "Registra l'audio del computer (la voce del candidato in videochiamata)"
+            "Registra l'audio del computer (la voce del candidato)"
         )
         self.system_check.setChecked(bool(settings.get("capture_system_audio", True)))
 
         for label, widget in (
             ("Modello di trascrizione", self.model_combo),
             ("Lingua del colloquio", self.language_combo),
+            ("Gestione dell'eco senza cuffie", self.echo_combo),
         ):
             caption = QLabel(label)
             caption.setProperty("class", "Muted")
@@ -471,13 +514,16 @@ class MainWindow(QMainWindow):
         left.add(self.mic_check)
         left.add(self.system_check)
 
-        note = QLabel(
-            "Cambiando modello di trascrizione potrebbe essere necessario un "
-            "nuovo download al riavvio dell'applicazione."
+        echo_help = QLabel(
+            "Senza cuffie la voce del candidato esce dalle casse e rientra nel "
+            "microfono: la stessa frase verrebbe attribuita a entrambi. La "
+            "modalita' automatica riconosce e scarta queste ripetizioni; quella "
+            "avanzata le sottrae dal segnale, cosi' resta udibile anche chi "
+            "interviene mentre l'altro parla, al prezzo di un po' di calcolo in piu'."
         )
-        note.setWordWrap(True)
-        note.setProperty("class", "Muted")
-        left.add(note)
+        echo_help.setWordWrap(True)
+        echo_help.setProperty("class", "Muted")
+        left.add(echo_help)
         left.body().addStretch(1)
         outer.addWidget(left, 1)
 
@@ -498,16 +544,16 @@ class MainWindow(QMainWindow):
         self.hardware_label.setProperty("class", "Muted")
         right.add(self.hardware_label)
 
-        if compat.is_emulated():
-            emulation_note = QLabel(
-                "Questo computer ha un processore ARM64 e l'applicazione gira in "
-                "emulazione: la trascrizione funziona ma e' piu' lenta. Sul "
-                "computer del cliente, se ha un processore Intel o AMD, sara' "
-                "sensibilmente piu' rapida."
+        cores = os.cpu_count() or 2
+        if cores <= 2:
+            weak = QLabel(
+                f"Questo computer ha {cores} core: con il modello 'Piccolo' la "
+                "trascrizione accumulera' ritardo. Scegli 'Base' per seguire il "
+                "parlato in tempo reale."
             )
-            emulation_note.setWordWrap(True)
-            emulation_note.setStyleSheet(f"color: {theme.WARNING};")
-            right.add(emulation_note)
+            weak.setWordWrap(True)
+            weak.setStyleSheet(f"color: {theme.WARNING};")
+            right.add(weak)
 
         self.retest_button = QPushButton("Ripeti il test di compatibilita'")
         self.retest_button.clicked.connect(self._retest_engine)
@@ -526,17 +572,86 @@ class MainWindow(QMainWindow):
         return page
 
     # ==================================================================
+    # Anteprima della videochiamata
+    # ==================================================================
+    def _refresh_window_list(self, notify: bool = False) -> None:
+        current = self.call_view.source.handle if self.call_view.source else None
+        windows = list_windows(exclude=int(self.winId()))
+
+        self.window_combo.blockSignals(True)
+        self.window_combo.clear()
+        self.window_combo.addItem("Nessuna anteprima", 0)
+        for info in windows:
+            self.window_combo.addItem(info.label, info.handle)
+        if current:
+            index = self.window_combo.findData(current)
+            self.window_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.window_combo.blockSignals(False)
+
+        if notify and not windows:
+            QMessageBox.information(
+                self,
+                "Nessuna finestra disponibile",
+                "Non ho trovato finestre da mostrare. Apri Teams, Zoom o la "
+                "scheda del browser con la videochiamata, poi premi Aggiorna.",
+            )
+
+    def _auto_select_call_window(self) -> None:
+        self._refresh_window_list()
+        if not self.call_view.available:
+            return
+        best = best_call_window(exclude=int(self.winId()))
+        if best is None:
+            return
+        if self.call_view.set_source(best):
+            index = self.window_combo.findData(best.handle)
+            if index >= 0:
+                self.window_combo.setCurrentIndex(index)
+            log.info("Anteprima agganciata a '%s'", best.title)
+
+    def _on_window_selected(self, index: int) -> None:
+        handle = self.window_combo.itemData(index)
+        if not handle:
+            self.call_view.clear()
+            return
+        for info in list_windows(exclude=int(self.winId())):
+            if info.handle == handle:
+                if not self.call_view.set_source(info):
+                    QMessageBox.information(
+                        self,
+                        "Anteprima non disponibile",
+                        "Non e' stato possibile agganciare questa finestra. "
+                        "Verifica che non sia ridotta a icona e riprova.",
+                    )
+                return
+        self._refresh_window_list()
+
+    def _on_tab_changed(self, index: int) -> None:
+        # La miniatura della videochiamata viene disegnata dal sistema
+        # sopra la nostra finestra: va nascosta quando si cambia scheda,
+        # altrimenti resterebbe visibile sopra il report.
+        self.call_view.set_visible_thumbnail(index == TAB_INTERVIEW)
+        if index == TAB_INTERVIEW:
+            self.call_view.refresh()
+
+    def moveEvent(self, event):  # noqa: N802 - firma imposta da Qt
+        super().moveEvent(event)
+        if hasattr(self, "call_view"):
+            self.call_view.refresh()
+
+    def resizeEvent(self, event):  # noqa: N802 - firma imposta da Qt
+        super().resizeEvent(event)
+        if hasattr(self, "call_view"):
+            self.call_view.refresh()
+
+    # ==================================================================
     # Preparazione all'avvio
     # ==================================================================
     def _keep_alive(self, worker) -> None:
-        """Mantiene un riferimento al worker fino alla sua conclusione."""
         self._live_workers.add(worker)
         worker.finished.connect(lambda w=worker: self._live_workers.discard(w))
 
     def _start_preparation(self) -> None:
-        # Senza questo controllo, un secondo clic sul pulsante di test
-        # sostituirebbe un worker ancora in esecuzione, e Qt chiuderebbe
-        # il programma all'istante.
         if self.startup_worker is not None and self.startup_worker.isRunning():
             return
 
@@ -555,7 +670,8 @@ class MainWindow(QMainWindow):
     def _on_download_progress(self, component: str, done: int, total: int) -> None:
         self.progress_bar.setVisible(True)
         if total > 0:
-            self.progress_bar.setValue(int(done / total * 100))
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(min(100, int(done / total * 100)))
             self.status_label.setText(
                 f"Download del modello di {component}: "
                 f"{done / 1048576:.0f} MB di {total / 1048576:.0f} MB"
@@ -586,8 +702,7 @@ class MainWindow(QMainWindow):
         if compat.is_emulated():
             text += (
                 "\n\nQuesto computer usa un processore ARM64 con emulazione x64: "
-                "e' la causa piu' probabile. L'applicazione dovrebbe funzionare "
-                "regolarmente su un PC con processore Intel o AMD."
+                "e' una causa possibile."
             )
         text += f"\n\nI dettagli tecnici sono nel file di log:\n{config.LOG_DIR}"
         QMessageBox.critical(self, "Motore di trascrizione non disponibile", text)
@@ -615,10 +730,6 @@ class MainWindow(QMainWindow):
             self.candidate_input.setFocus()
             return
 
-        # Ogni collegamento con la sessione precedente va tagliato prima
-        # di crearne una nuova: se i suoi thread fossero ancora vivi, le
-        # frasi del candidato precedente comparirebbero nella schermata
-        # del candidato successivo.
         self._release_session()
 
         self.transcript_view.clear()
@@ -626,6 +737,7 @@ class MainWindow(QMainWindow):
         self._warnings.clear()
         self._pending = {}
         self.warning_label.setVisible(False)
+        self.echo_chip.setVisible(False)
         self.current_interview_id = None
         self.export_docx_button.setEnabled(False)
         self.export_txt_button.setEnabled(False)
@@ -636,6 +748,7 @@ class MainWindow(QMainWindow):
             capture_microphone=bool(settings.get("capture_microphone", True)),
             capture_system_audio=bool(settings.get("capture_system_audio", True)),
             language=settings.get("transcription_language", "auto"),
+            echo_mode=settings.get("echo_mode", echo_module.MODE_AUTO),
         )
         self.session.segment_received.connect(self._on_segment)
         self.session.level_changed.connect(self._on_level)
@@ -659,9 +772,9 @@ class MainWindow(QMainWindow):
         self.recording_dot.set_color(theme.DANGER)
 
         for speaker, label in self.source_labels.items():
-            name = sources.get(speaker)
-            label.setText(name if name else "non attivo")
-            label.setToolTip(name or "")
+            device = sources.get(speaker)
+            label.setToolTip(device or "Sorgente non attiva")
+            label.setEnabled(bool(device))
         self.status_label.setText("Registrazione in corso.")
 
     def _on_session_start_failed(self, message: str) -> None:
@@ -672,7 +785,6 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "Impossibile avviare la registrazione", message)
 
     def _release_session(self) -> None:
-        """Taglia ogni collegamento con la sessione corrente."""
         if self.session is None:
             return
         try:
@@ -691,10 +803,10 @@ class MainWindow(QMainWindow):
         self.recording_dot.set_color(theme.TEXT_MUTED)
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setVisible(True)
-        # L'arresto e' asincrono: smaltire la coda di trascrizione puo'
-        # richiedere decine di secondi e bloccare qui l'interfaccia
-        # significherebbe mostrare all'utente una finestra "non risponde"
-        # proprio mentre il colloquio non e' ancora stato salvato.
+        # L'arresto e' asincrono: smaltire la coda puo' richiedere
+        # decine di secondi e bloccare qui l'interfaccia mostrerebbe
+        # all'utente una finestra "non risponde" proprio mentre il
+        # colloquio non e' ancora stato salvato.
         self.session.stop()
 
     def _on_session_stopped(self) -> None:
@@ -728,6 +840,7 @@ class MainWindow(QMainWindow):
         self._save_current_interview()
 
         if settings.get("auto_generate_report", True):
+            self.tabs.setCurrentIndex(TAB_REPORT)
             self._generate_report()
         else:
             self.report_button.setEnabled(True)
@@ -764,8 +877,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Report gia' in corso",
-                "E' gia' in corso la generazione di un report: attendi che "
-                "finisca prima di avviarne un altro.",
+                "E' gia' in corso la generazione di un report: attendi che finisca.",
             )
             return
 
@@ -804,13 +916,10 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 100)
         self.report_view.setPlainText(result.text)
         self.report_button.setEnabled(True)
-        self.current_report_used_llm = bool(result.used_llm)
 
         if self.current_interview_id is not None:
             try:
-                db.update_report(
-                    self.current_interview_id, result.text, result.used_llm
-                )
+                db.update_report(self.current_interview_id, result.text, result.used_llm)
                 self._refresh_history()
             except Exception:
                 log.exception("Aggiornamento del report non riuscito")
@@ -890,10 +999,11 @@ class MainWindow(QMainWindow):
                 f"domande poste: {stats['questions']} — "
                 f"parlato del candidato: {stats['candidate_share']}%"
             )
+            if self.session.speakers_detected and not self.echo_chip.isVisible():
+                self.echo_chip.setText("Altoparlanti rilevati — eco gestita")
+                self.echo_chip.setVisible(True)
 
     def _refresh_platform(self) -> None:
-        # L'elenco dei processi va letto fuori dal thread grafico: farlo
-        # qui produrrebbe uno scatto visibile a ogni aggiornamento.
         if self.platform_probe is not None and self.platform_probe.isRunning():
             return
         self.platform_probe = PlatformProbe()
@@ -927,17 +1037,18 @@ class MainWindow(QMainWindow):
         if not enabled:
             self.transcript_view.setPlaceholderText(
                 "Sottotitoli nascosti. La registrazione e la trascrizione "
-                "continuano regolarmente: utile mentre condividi lo schermo."
+                "proseguono: utile mentre condividi lo schermo."
             )
 
     def _apply_always_on_top(self, enabled: bool) -> None:
         settings.set("always_on_top", bool(enabled))
         self.setWindowFlag(Qt.WindowStaysOnTopHint, bool(enabled))
         self.show()
+        if hasattr(self, "call_view"):
+            self.call_view.refresh()
 
     @staticmethod
     def _restyle(widget: QWidget) -> None:
-        """Riapplica il foglio di stile dopo un cambio di objectName."""
         widget.style().unpolish(widget)
         widget.style().polish(widget)
 
@@ -1068,6 +1179,7 @@ class MainWindow(QMainWindow):
             {
                 "whisper_model_size": new_model,
                 "transcription_language": self.language_combo.currentData(),
+                "echo_mode": self.echo_combo.currentData(),
                 "capture_microphone": self.mic_check.isChecked(),
                 "capture_system_audio": self.system_check.isChecked(),
                 "cpu_mode": new_cpu,
@@ -1121,8 +1233,6 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
 
-        # L'arresto della sessione e' asincrono: rifiutiamo la chiusura
-        # per ora e la ripetiamo quando la sessione ha finito davvero.
         if self.session is not None:
             self.closing = True
             self.status_label.setText("Chiusura in corso...")
@@ -1138,11 +1248,8 @@ class MainWindow(QMainWindow):
 
         self.elapsed_timer.stop()
         self.platform_timer.stop()
+        self.call_view.clear()
 
-        # I processi di lavoro vanno interrotti e attesi davvero:
-        # distruggere un thread ancora in esecuzione chiude il programma
-        # in modo anomalo, e un processo di generazione abbandonato
-        # continuerebbe a occupare il processore, invisibile all'utente.
         for worker in (self.report_worker, self.startup_worker, self.platform_probe):
             if worker is None or not worker.isRunning():
                 continue

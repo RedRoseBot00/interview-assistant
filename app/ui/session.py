@@ -42,6 +42,7 @@ class InterviewSession(QObject):
         capture_microphone: bool = True,
         capture_system_audio: bool = True,
         language: str = "auto",
+        echo_mode: str = "auto",
         parent: QObject | None = None,
     ):
         super().__init__(parent)
@@ -64,6 +65,7 @@ class InterviewSession(QObject):
         self.engine = TranscriptionEngine(
             model_size=whisper_model_size,
             language=language,
+            echo_mode=echo_mode,
             on_segment=self._handle_segment,
             on_status=self._handle_status,
             on_error=self._handle_engine_error,
@@ -227,6 +229,11 @@ class InterviewSession(QObject):
     @property
     def pending_chunks(self) -> int:
         return self.engine.backlog
+
+    @property
+    def speakers_detected(self) -> bool:
+        """True quando l'app ha riconosciuto l'eco degli altoparlanti."""
+        return self.engine.speakers_detected
 
     def segments(self) -> list[dict]:
         return self.engine.segments_as_dicts()
