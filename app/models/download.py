@@ -476,7 +476,7 @@ def _check_disk_space() -> None:
     Verifica lo spazio prima di cominciare.
 
     Senza questo controllo l'utente aspettava venti minuti e riceveva
-    poi un messaggio di sistema in inglese ("No space left on device")
+    poi un messaggio grezzo del sistema ("No space left on device")
     proveniente dal punto piu' improbabile del programma.
     """
     try:
