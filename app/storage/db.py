@@ -39,6 +39,8 @@ _MIGRATIONS = {
     "segments_json": "ALTER TABLE interviews ADD COLUMN segments_json TEXT",
     "used_llm": "ALTER TABLE interviews ADD COLUMN used_llm INTEGER DEFAULT 0",
     "notes": "ALTER TABLE interviews ADD COLUMN notes TEXT",
+    "experience": "ALTER TABLE interviews ADD COLUMN experience TEXT",
+    "skills": "ALTER TABLE interviews ADD COLUMN skills TEXT",
 }
 
 _init_lock = threading.Lock()
@@ -57,6 +59,8 @@ class Interview:
     segments: list[dict] = field(default_factory=list)
     used_llm: bool = False
     notes: str = ""
+    experience: str = ""
+    skills: str = ""
     id: Optional[int] = None
 
     @property
@@ -150,6 +154,8 @@ def _row_to_interview(row: sqlite3.Row) -> Interview:
         segments=segments,
         used_llm=bool(data.get("used_llm")),
         notes=str(data.get("notes") or ""),
+        experience=str(data.get("experience") or ""),
+        skills=str(data.get("skills") or ""),
     )
 
 
@@ -164,8 +170,8 @@ def save_interview(interview: Interview) -> int:
                 INSERT INTO interviews
                     (candidate_name, role, created_at, duration_seconds,
                      detected_language, transcript, report, segments_json,
-                     used_llm, notes)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     used_llm, notes, experience, skills)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     interview.candidate_name,
@@ -178,6 +184,8 @@ def save_interview(interview: Interview) -> int:
                     json.dumps(interview.segments, ensure_ascii=False),
                     1 if interview.used_llm else 0,
                     interview.notes,
+                    interview.experience,
+                    interview.skills,
                 ),
             )
             return int(cursor.lastrowid)
@@ -187,19 +195,42 @@ def save_interview(interview: Interview) -> int:
 
 def update_report(interview_id: int, report: str, used_llm: bool) -> None:
     init_db()
-    with _connect() as conn:
-        conn.execute(
-            "UPDATE interviews SET report = ?, used_llm = ? WHERE id = ?",
-            (report, 1 if used_llm else 0, interview_id),
-        )
+
+    def _operation() -> None:
+        with _connect() as conn:
+            conn.execute(
+                "UPDATE interviews SET report = ?, used_llm = ? WHERE id = ?",
+                (report, 1 if used_llm else 0, interview_id),
+            )
+
+    _with_recovery(_operation)
 
 
-def update_notes(interview_id: int, notes: str) -> None:
+def update_notes(
+    interview_id: int,
+    notes: str,
+    experience: str | None = None,
+    skills: str | None = None,
+) -> None:
     init_db()
-    with _connect() as conn:
-        conn.execute(
-            "UPDATE interviews SET notes = ? WHERE id = ?", (notes, interview_id)
-        )
+
+    def _operation() -> None:
+        with _connect() as conn:
+            conn.execute(
+                "UPDATE interviews SET notes = ? WHERE id = ?", (notes, interview_id)
+            )
+            if experience is not None:
+                conn.execute(
+                    "UPDATE interviews SET experience = ? WHERE id = ?",
+                    (experience, interview_id),
+                )
+            if skills is not None:
+                conn.execute(
+                    "UPDATE interviews SET skills = ? WHERE id = ?",
+                    (skills, interview_id),
+                )
+
+    _with_recovery(_operation)
 
 
 def list_interviews(limit: int = 500) -> list[Interview]:
@@ -227,14 +258,22 @@ def list_interviews(limit: int = 500) -> list[Interview]:
 
 def get_interview(interview_id: int) -> Optional[Interview]:
     init_db()
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT * FROM interviews WHERE id = ?", (interview_id,)
-        ).fetchone()
-        return _row_to_interview(row) if row else None
+
+    def _operation() -> Optional[Interview]:
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM interviews WHERE id = ?", (interview_id,)
+            ).fetchone()
+            return _row_to_interview(row) if row else None
+
+    return _with_recovery(_operation)
 
 
 def delete_interview(interview_id: int) -> None:
     init_db()
-    with _connect() as conn:
-        conn.execute("DELETE FROM interviews WHERE id = ?", (interview_id,))
+
+    def _operation() -> None:
+        with _connect() as conn:
+            conn.execute("DELETE FROM interviews WHERE id = ?", (interview_id,))
+
+    _with_recovery(_operation)
