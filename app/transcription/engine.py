@@ -156,6 +156,15 @@ def _normalise(word: str) -> str:
     return word.strip(".,;:!?'\"()").lower()
 
 
+def _echoes_prompt(text: str) -> bool:
+    """La trascrizione e' solo una copia del suggerimento di contesto?"""
+    pulito = " ".join(_normalise(w) for w in text.split())
+    modello = " ".join(_normalise(w) for w in config.TRANSCRIPTION_PROMPT.split())
+    if not pulito:
+        return False
+    return pulito == modello or (len(pulito) > 20 and pulito in modello)
+
+
 def _strip_overlap(previous: str, current: str, max_words: int = 8) -> str:
     """
     Rimuove la ripetizione dovuta alla sovrapposizione tra blocchi.
@@ -232,6 +241,10 @@ class TranscriptionEngine:
         # Rapporto fra durata dell'audio e tempo impiegato a trascriverlo.
         self.realtime_factor = 0.0
         self._speed_samples = 0
+        # 0 = minimo indispensabile, 1 = ricerca media, 2 = ricerca ampia.
+        # Si parte dal livello medio: sui computer che reggono resta li'
+        # o sale, su quelli lenti scende dopo le prime frasi.
+        self._quality_level = 1
 
         self.segments: list[TranscriptSegment] = []
         self.backlog = 0
@@ -645,16 +658,17 @@ class TranscriptionEngine:
         sonda = self._should_probe_language(parlato)
         lingua_chiamata = None if sonda else self._locked_language
 
+        fascio, temperature = self._decoding_quality()
+
         started = time.monotonic()
         segments, info = self._model.transcribe(
             audio,
             language=lingua_chiamata,
-            # Ricerca greedy: su un processore da portatile una ricerca
-            # piu' ampia costa il triplo del tempo e migliora pochissimo
-            # il parlato spontaneo.
-            beam_size=1,
-            best_of=1,
-            temperature=0.0,
+            # Ampiezza della ricerca e scala dei tentativi decise in base
+            # a quanto il computer sta al passo: vedi _decoding_quality.
+            beam_size=fascio,
+            best_of=5,
+            temperature=temperature,
             # Il silenzio l'abbiamo gia' tolto noi con il rilevatore di
             # voce: rifarlo qui costerebbe tempo per nulla.
             vad_filter=False,
@@ -685,6 +699,15 @@ class TranscriptionEngine:
 
         text = " ".join(part for part in parts if part).strip()
         if not text:
+            self._forget_last(chunk.speaker)
+            return
+
+        # Difesa contro un guasto noto: su una frase breve o disturbata
+        # il modello, invece di trascrivere, restituisce il suggerimento
+        # di contesto che gli abbiamo dato. Il risultato e' una riga che
+        # nessuno ha pronunciato, ripetuta a ogni pausa.
+        if _echoes_prompt(text):
+            log.debug("Scartata una ripetizione del suggerimento di contesto")
             self._forget_last(chunk.speaker)
             return
 
@@ -766,6 +789,33 @@ class TranscriptionEngine:
         """
         with self._lock:
             self._last_text.pop(speaker, None)
+
+    def _decoding_quality(self) -> tuple[int, tuple[float, ...]]:
+        """
+        Quanta cura mettere nella trascrizione del prossimo blocco.
+
+        Il tempo risparmiato con le correzioni sull'arretrato va speso
+        in precisione, non lasciato sul tavolo — ma solo finche' il
+        computer regge. La scala dei tentativi a temperatura crescente
+        resta SEMPRE attiva, perche' costa qualcosa unicamente quando il
+        primo tentativo e' venuto male; a variare e' solo quanto in
+        profondita' si cerca.
+        """
+        arretrato = len(self._local) + len(self._waiting)
+        veloce = self.realtime_factor
+
+        if arretrato >= BACKLOG_AGGRESSIVE_MERGE or (
+            self._speed_samples and veloce < config.SPEED_LOWER_QUALITY
+        ):
+            self._quality_level = 0
+        elif self._speed_samples >= 3 and veloce >= config.SPEED_RAISE_QUALITY:
+            self._quality_level = min(2, self._quality_level + 1)
+
+        if self._quality_level >= 2:
+            return config.DECODE_BEAM_MAX, config.DECODE_TEMPERATURES_FULL
+        if self._quality_level == 1:
+            return config.DECODE_BEAM_MID, config.DECODE_TEMPERATURES_FULL
+        return config.DECODE_BEAM_MIN, config.DECODE_TEMPERATURES_FAST
 
     def _prompt_for_call(self, language: Optional[str]) -> Optional[str]:
         """
