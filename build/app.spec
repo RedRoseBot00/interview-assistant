@@ -66,6 +66,7 @@ hiddenimports += [
     "app.compat",
     "app.diagnostics",
     "app.settings",
+    "app.single_instance",
     "app.audio.capture",
     "app.transcription.engine",
     "app.summarization.llm",
