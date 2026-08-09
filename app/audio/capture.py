@@ -43,6 +43,7 @@ from typing import Callable, Optional
 import numpy as np
 
 from app import config
+from app.audio.vad import VoiceSegmenter
 
 log = logging.getLogger(__name__)
 
@@ -62,7 +63,22 @@ except ImportError:  # pragma: no cover - utile in sviluppo su Linux/Mac
 
 READ_FRAMES = 1024
 MAX_CONSECUTIVE_READ_ERRORS = 60
-QUEUE_MAX_CHUNKS = 96  # ~7 minuti di arretrato per sorgente: oltre, si scarta
+
+# L'arretrato si misura in SECONDI DI PARLATO, non in numero di blocchi.
+# La versione precedente teneva in coda fino a 96 blocchi: essendo ogni
+# blocco una frase intera (fino a diversi secondi), significava
+# accumulare cinque-otto minuti di ritardo prima di scartare qualcosa.
+# Su un computer lento la coda restava stabilmente piena e i sottotitoli
+# arrivavano minuti dopo la voce: era questa, e non il riconoscimento
+# vocale in se', la causa principale della lentezza percepita.
+MAX_BACKLOG_SECONDS = 25.0
+# Limite di sicurezza sul numero di elementi, per non far crescere la
+# memoria senza fine se il motore si ferma del tutto.
+QUEUE_HARD_LIMIT = 512
+PROGRESS_INTERVAL_SECONDS = 0.5  # frequenza degli avvisi di avanzamento
+# Oltre questo numero di elementi in coda gli avvisi di avanzamento non
+# servono piu' a nulla e occuperebbero soltanto spazio.
+PROGRESS_QUEUE_LIMIT = 48
 
 
 class AudioError(Exception):
@@ -80,49 +96,156 @@ class DeviceInfo:
 
 @dataclass
 class AudioChunk:
-    """Blocco audio mono a 16 kHz, gia' attribuito a un interlocutore."""
+    """Frase completa, mono a 16 kHz, gia' attribuita a un interlocutore."""
 
     speaker: str
     samples: np.ndarray
-    # Istante di inizio del blocco, in secondi dall'avvio della
-    # registrazione. Usiamo un orologio monotono: quello di sistema puo'
-    # essere corretto dalla rete durante il colloquio e produrrebbe
-    # durate sbagliate, perfino negative.
+    # Istante di inizio, in secondi dall'avvio della registrazione, con
+    # la stessa origine per entrambi i canali. Usiamo un orologio
+    # monotono: quello di sistema puo' essere corretto dalla rete
+    # durante il colloquio e produrrebbe durate sbagliate.
     offset: float = 0.0
     wall_time: float = field(default_factory=time.time)
+    # Vero quando la frase e' il seguito di una troncata per durata
+    # massima: solo in quel caso ha senso togliere le parole ripetute.
+    continues_previous: bool = False
+
+
+class AudioQueue(queue.Queue):
+    """
+    Coda che sa quanti secondi di audio contiene.
+
+    Serve a limitare l'arretrato per durata invece che per numero di
+    elementi: un blocco puo' valere mezzo secondo o quindici, quindi
+    contare gli elementi non dice nulla su quanto ritardo abbia
+    accumulato la trascrizione. Il conteggio viene aggiornato dentro
+    _put e _get, che la classe base chiama gia' con il proprio lock
+    acquisito: non serve alcuna sincronizzazione aggiuntiva.
+    """
+
+    def __init__(self, maxsize: int = 0, sample_rate: int = config.AUDIO_SAMPLE_RATE):
+        super().__init__(maxsize=maxsize)
+        self._sample_rate = float(max(1, sample_rate))
+        self.pending_seconds = 0.0
+
+    @staticmethod
+    def _samples(item) -> int:
+        data = getattr(item, "samples", None)
+        return int(getattr(data, "size", 0) or 0)
+
+    def _put(self, item):
+        super()._put(item)
+        self.pending_seconds += self._samples(item) / self._sample_rate
+
+    def _get(self):
+        item = super()._get()
+        self.pending_seconds = max(
+            0.0, self.pending_seconds - self._samples(item) / self._sample_rate
+        )
+        return item
 
 
 # --------------------------------------------------------------------------
 # Conversione del formato
 # --------------------------------------------------------------------------
+# Sotto questa soglia, rispetto al canale piu' forte, un canale e'
+# considerato spento: mediarlo insieme agli altri dimezzerebbe soltanto
+# il volume del segnale utile.
+_SILENT_CHANNEL_RATIO = 0.01   # -40 dB
+
+
 def to_mono(samples: np.ndarray, channels: int) -> np.ndarray:
+    """
+    Riduce a un canale solo.
+
+    La media aritmetica sembra la scelta ovvia, ma e' sbagliata nel caso
+    piu' comune sui portatili: un microfono dichiarato stereo che porta
+    il segnale su un canale solo e silenzio sull'altro. Mediandoli si
+    perdono 6 dB, e il parlato finisce sotto le soglie di silenzio senza
+    che nulla lo segnali. Quando un canale e' palesemente muto usiamo
+    quindi soltanto quello attivo.
+    """
     if channels <= 1:
-        return samples
+        # I dati provengono da un buffer di sola lettura: la copia evita
+        # che una futura elaborazione sul posto fallisca in modo oscuro.
+        return np.array(samples, dtype=np.float32, copy=True)
     usable = (samples.size // channels) * channels
     if usable == 0:
         return np.zeros(0, dtype=np.float32)
-    return samples[:usable].reshape(-1, channels).mean(axis=1).astype(np.float32)
+
+    frame = samples[:usable].reshape(-1, channels)
+    energy = np.sqrt(np.mean(np.square(frame, dtype=np.float64), axis=0))
+    loudest = float(energy.max()) if energy.size else 0.0
+    if loudest > 0.0:
+        active = energy >= loudest * _SILENT_CHANNEL_RATIO
+        if not active.all():
+            return frame[:, active].mean(axis=1).astype(np.float32)
+    return frame.mean(axis=1).astype(np.float32)
+
+
+_FIR_CACHE: dict[tuple[int, int], np.ndarray] = {}
+
+
+def _antialias_kernel(source_rate: int, target_rate: int) -> np.ndarray:
+    """
+    Filtro passa-basso a fase lineare, calcolato una volta sola.
+
+    La versione precedente usava una media mobile su tre campioni. A
+    8 kHz — cioe' proprio al limite della banda che Whisper analizza —
+    quel filtro attenua di appena 3,5 dB: tutto il contenuto fra 8 e
+    16 kHz si ripiegava dentro la banda vocale quasi intatto, sporcando
+    il segnale. E' la ragione principale per cui la trascrizione
+    "capiva male", del tutto indipendente dalla potenza del computer.
+    """
+    key = (source_rate, target_rate)
+    cached = _FIR_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    taps = 127                      # dispari: ritardo intero, facile da togliere
+    # Taglio poco sotto la nuova frequenza di Nyquist, per lasciare
+    # spazio alla transizione del filtro senza toccare il parlato.
+    cutoff = 0.45 * target_rate / source_rate      # in cicli/campione
+    n = np.arange(taps, dtype=np.float64) - (taps - 1) / 2.0
+    kernel = 2.0 * cutoff * np.sinc(2.0 * cutoff * n)
+    kernel *= np.hamming(taps)
+    total = kernel.sum()
+    if total:
+        kernel /= total             # guadagno unitario in continua
+    kernel = kernel.astype(np.float32)
+    _FIR_CACHE[key] = kernel
+    return kernel
+
+
+def _convolve_same(signal: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+    """Convoluzione centrata, passando per la FFT sui segnali lunghi."""
+    if signal.size < 4096:
+        return np.convolve(signal, kernel, mode="same").astype(np.float32)
+
+    size = 1
+    needed = signal.size + kernel.size - 1
+    while size < needed:
+        size *= 2
+    spectrum = np.fft.rfft(signal, size) * np.fft.rfft(kernel, size)
+    full = np.fft.irfft(spectrum, size)
+    start = (kernel.size - 1) // 2
+    return full[start : start + signal.size].astype(np.float32)
 
 
 def resample(samples: np.ndarray, source_rate: int, target_rate: int) -> np.ndarray:
     """
-    Riduce la frequenza di campionamento applicando prima un filtro
-    anti-aliasing elementare.
+    Riduce la frequenza di campionamento applicando prima un vero
+    filtro anti-aliasing.
 
-    Senza il filtro le frequenze alte si ripiegherebbero sulle basse,
-    producendo un sibilo che peggiora sensibilmente il riconoscimento
-    vocale. Da applicare su finestre lunghe (secondi), non su blocchi
-    minuscoli: vedi la nota in cima al modulo.
+    Da applicare su finestre lunghe (secondi), non su blocchi minuscoli:
+    vedi la nota in cima al modulo.
     """
     samples = np.asarray(samples, dtype=np.float32)
     if samples.size == 0 or source_rate == target_rate:
         return samples
 
-    if source_rate > target_rate:
-        window = max(1, int(round(source_rate / target_rate)))
-        if window > 1 and samples.size > window:
-            kernel = np.ones(window, dtype=np.float32) / window
-            samples = np.convolve(samples, kernel, mode="same").astype(np.float32)
+    if source_rate > target_rate and samples.size > 8:
+        samples = _convolve_same(samples, _antialias_kernel(source_rate, target_rate))
 
     target_length = int(round(samples.size * target_rate / source_rate))
     if target_length <= 0:
@@ -262,7 +385,12 @@ class DeviceCatalog:
             index=int(candidate["index"]),
             name=str(candidate.get("name", "Audio di sistema")),
             sample_rate=int(candidate.get("defaultSampleRate") or 48000),
-            channels=min(2, channels),
+            # Il loopback WASAPI in modalita' condivisa va aperto con
+            # ESATTAMENTE il formato del mixer di Windows. Limitarlo a
+            # due canali faceva fallire l'apertura su chi ha un impianto
+            # surround o un monitor HDMI multicanale, e in quel caso la
+            # voce del candidato non veniva trascritta affatto.
+            channels=max(1, channels),
             is_loopback=True,
         )
 
@@ -299,58 +427,91 @@ class _SourceReader(threading.Thread):
         self.started_ok = threading.Event()
         self.dropped_chunks = 0
 
-        # Le soglie sono calcolate nella frequenza nativa del
-        # dispositivo: il ricampionamento avviene una volta sola, sulla
-        # finestra completa.
-        rate = device.sample_rate
-        self._chunk_samples = int(config.TRANSCRIBE_CHUNK_SECONDS * rate)
-        overlap = int(config.TRANSCRIBE_OVERLAP_SECONDS * rate)
-        # Difesa contro una configurazione incoerente: con una
-        # sovrapposizione maggiore della finestra il buffer non
-        # calerebbe mai e il ciclo girerebbe all'infinito.
-        self._overlap_samples = max(0, min(overlap, self._chunk_samples // 2))
-        self._buffer = np.zeros(0, dtype=np.float32)
-        self._consumed = 0  # campioni gia' emessi, per calcolare l'offset
+        # Il taglio in frasi avviene alla frequenza nativa del
+        # dispositivo; la conversione a 16 kHz viene fatta una sola
+        # volta, sulla frase completa.
+        self._segmenter = VoiceSegmenter(device.sample_rate)
+
+        # Scarto fra l'avvio della registrazione e il primo campione di
+        # QUESTA sorgente. I due dispositivi non si aprono nello stesso
+        # istante e senza questa correzione ciascun canale conterebbe i
+        # secondi da un momento diverso: differenze anche di pochi
+        # decimi mandano l'eco fuori dalla finestra di ricerca.
+        self._epoch = 0.0
+        self._last_progress = -1.0
 
     # ------------------------------------------------------------------
-    def _enqueue(self, samples: np.ndarray, offset: float) -> None:
+    def _enqueue(
+        self, samples: np.ndarray, offset: float, continues: bool = False
+    ) -> None:
         """
         Accoda senza mai bloccare il thread audio.
 
-        Se la trascrizione non tiene il passo, scartiamo il blocco piu'
-        vecchio: e' preferibile perdere qualche secondo di audio
-        piuttosto che bloccare la registrazione, congelare gli
-        indicatori di livello e impedire la chiusura del programma.
+        Se la trascrizione non tiene il passo scartiamo l'audio piu'
+        vecchio, finche' l'attesa torna sotto il limite: e' preferibile
+        perdere qualche secondo lontano nel tempo piuttosto che mostrare
+        i sottotitoli con minuti di ritardo. Scartare il piu' vecchio,
+        e non il piu' recente, riporta il motore al presente.
         """
-        chunk = AudioChunk(self.speaker, samples, offset=offset)
-        try:
-            self._output.put_nowait(chunk)
-            return
-        except queue.Full:
-            pass
-
-        try:
-            self._output.get_nowait()
-            self.dropped_chunks += 1
-        except queue.Empty:
-            pass
-        try:
-            self._output.put_nowait(chunk)
-        except queue.Full:
-            self.dropped_chunks += 1
-
-    def _emit_window(self) -> None:
-        window_native = self._buffer[: self._chunk_samples]
-        advance = self._chunk_samples - self._overlap_samples
-        offset = self._consumed / self.device.sample_rate
-        self._consumed += advance
-        self._buffer = self._buffer[advance:]
-
-        window = resample(
-            window_native, self.device.sample_rate, config.AUDIO_SAMPLE_RATE
+        chunk = AudioChunk(
+            self.speaker, samples, offset=offset, continues_previous=continues
         )
-        if window.size:
-            self._enqueue(window, offset)
+        duration = samples.size / float(config.AUDIO_SAMPLE_RATE)
+
+        pending = getattr(self._output, "pending_seconds", 0.0)
+        while pending + duration > MAX_BACKLOG_SECONDS:
+            try:
+                stale = self._output.get_nowait()
+            except queue.Empty:
+                break
+            if getattr(stale.samples, "size", 0):
+                self.dropped_chunks += 1
+            nuovo = getattr(self._output, "pending_seconds", 0.0)
+            if nuovo >= pending:
+                break          # coda senza contatore: evitiamo il ciclo infinito
+            pending = nuovo
+
+        try:
+            self._output.put_nowait(chunk)
+        except queue.Full:
+            self.dropped_chunks += 1
+
+    def _emit(self, utterance) -> None:
+        samples = resample(
+            utterance.samples, self.device.sample_rate, config.AUDIO_SAMPLE_RATE
+        )
+        if samples.size:
+            self._enqueue(
+                samples,
+                self._epoch + utterance.start_offset,
+                utterance.continues_previous,
+            )
+
+    def _publish_progress(self) -> None:
+        """
+        Segnala all'altro canale fin dove questo e' stato analizzato.
+
+        Serve al riconoscimento dell'eco: se il candidato tace, senza
+        questo avviso il microfono resterebbe in attesa di un
+        riferimento che non arrivera' mai, e ogni domanda comparirebbe
+        nei sottotitoli con secondi di ritardo.
+        """
+        if self.speaker != config.SPEAKER_CANDIDATE:
+            return
+        settled = self._epoch + self._segmenter.settled_seconds
+        if settled - self._last_progress < PROGRESS_INTERVAL_SECONDS:
+            return
+        # Se la coda e' gia' lunga questi avvisi non aiutano piu'
+        # nessuno: toglierebbero soltanto spazio all'audio vero.
+        if self._output.qsize() >= PROGRESS_QUEUE_LIMIT:
+            return
+        self._last_progress = settled
+        try:
+            self._output.put_nowait(
+                AudioChunk(self.speaker, np.zeros(0, dtype=np.float32), offset=settled)
+            )
+        except queue.Full:
+            pass
 
     def run(self) -> None:  # noqa: C901 - flusso lineare, leggibile
         stream = None
@@ -366,6 +527,9 @@ class _SourceReader(threading.Thread):
                     frames_per_buffer=READ_FRAMES,
                 )
             self.started_ok.set()
+            # Origine comune ai due canali, misurata quando il
+            # dispositivo comincia davvero a produrre campioni.
+            self._epoch = max(0.0, time.monotonic() - self._started_at)
             log.info(
                 "Sorgente '%s' avviata: %s (%d Hz, %d canali)",
                 self.speaker,
@@ -398,30 +562,29 @@ class _SourceReader(threading.Thread):
                 if self._on_level is not None:
                     self._on_level(self.speaker, rms_level(mono))
 
-                self._buffer = np.concatenate([self._buffer, mono])
-                while self._buffer.size >= self._chunk_samples:
-                    self._emit_window()
+                # Il rilevatore restituisce solo le frasi concluse: il
+                # silenzio non arriva mai al riconoscimento vocale.
+                for utterance in self._segmenter.feed(mono):
+                    self._emit(utterance)
+                self._publish_progress()
 
         except Exception as exc:
             log.exception("Sorgente audio '%s' interrotta", self.speaker)
             if self._on_error:
                 self._on_error(self.speaker, exc)
         finally:
-            # Ultimo tratto: non perdiamo la coda del discorso. Il
-            # confronto tiene conto della sovrapposizione, che e' gia'
-            # stata trascritta con la finestra precedente.
+            # Ultima frase: non perdiamo la coda del discorso.
             try:
-                fresh = self._buffer.size - self._overlap_samples
-                if fresh > 0.25 * self.device.sample_rate:
-                    tail = resample(
-                        self._buffer, self.device.sample_rate, config.AUDIO_SAMPLE_RATE
-                    )
-                    if tail.size:
-                        self._enqueue(tail, self._consumed / self.device.sample_rate)
+                for utterance in self._segmenter.flush():
+                    self._emit(utterance)
             except Exception:
-                log.debug("Ultimo blocco audio non recuperato", exc_info=True)
+                log.debug("Ultima frase non recuperata", exc_info=True)
 
-            self._buffer = np.zeros(0, dtype=np.float32)
+            log.info(
+                "Sorgente '%s': parlato rilevato sul %.0f%% del tempo",
+                self.speaker,
+                self._segmenter.speech_ratio * 100,
+            )
             if stream is not None:
                 with self._pa_lock:
                     for action in (stream.stop_stream, stream.close):
@@ -451,8 +614,8 @@ class AudioRecorder:
         self._on_level = on_level
         self._on_error = on_error
 
-        self.audio_queue: "queue.Queue[AudioChunk]" = queue.Queue(
-            maxsize=QUEUE_MAX_CHUNKS
+        self.audio_queue: AudioQueue = AudioQueue(
+            maxsize=QUEUE_HARD_LIMIT, sample_rate=config.AUDIO_SAMPLE_RATE
         )
         self._stop = threading.Event()
         self._readers: list[_SourceReader] = []
@@ -481,9 +644,19 @@ class AudioRecorder:
             self._stop.set()
             for reader in self._readers:
                 reader.join(timeout=2)
-            self._readers.clear()
-            catalog.close()
-            self._catalog = None
+            ancora_vivi = [r for r in self._readers if r.is_alive()]
+            self._readers = ancora_vivi
+            if ancora_vivi:
+                # Chiudere PortAudio con uno stream ancora aperto in un
+                # altro thread fa terminare di colpo il programma: e'
+                # preferibile lasciarlo aperto.
+                log.error(
+                    "PortAudio non chiuso: sorgenti ancora attive %s",
+                    [r.speaker for r in ancora_vivi],
+                )
+            else:
+                catalog.close()
+                self._catalog = None
             raise
 
     def _start_with_catalog(self, catalog: DeviceCatalog) -> None:
@@ -578,8 +751,9 @@ class AudioRecorder:
         if dropped:
             self.warnings.append(
                 "Il computer non e' riuscito a trascrivere in tempo reale: "
-                f"{dropped} blocchi audio non sono stati elaborati. "
-                "Nelle impostazioni puoi scegliere un modello piu' leggero."
+                f"{dropped} frasi non sono state elaborate per non far "
+                "accumulare ritardo ai sottotitoli. Nelle impostazioni "
+                "puoi scegliere un modello di trascrizione piu' leggero."
             )
 
         if still_alive:

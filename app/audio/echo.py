@@ -62,8 +62,32 @@ FORWARD_MARGIN_SECONDS = 0.10
 
 # Lunghezza del filtro di cancellazione: 32 ms coprono la coda di
 # riverbero di una stanza normale. Allungarlo migliora poco e costa
-# molto, perche' il calcolo cresce con il quadrato.
+# molto: la soluzione del sistema cresce con il cubo del numero di
+# coefficienti.
 FILTER_TAPS = 512
+
+# Riconoscimento dell'uso delle cuffie.
+#
+# Con le cuffie la voce del candidato non passa dall'aria e non torna
+# mai nel microfono: l'analisi dell'eco gira allora a vuoto su ogni
+# singola frase, per tutta la durata del colloquio, spendendo tempo di
+# calcolo che sul computer del cliente serve alla trascrizione. Dopo un
+# certo numero di frasi senza la minima somiglianza smettiamo, e ci
+# limitiamo a un controllo saltuario per accorgerci se le cuffie
+# vengono sfilate a meta' colloquio.
+HEADPHONES_QUIET_UTTERANCES = 15
+# Fattore di riduzione usato per il controllo rapido durante la
+# sospensione: a un quarto della frequenza di campionamento la ricerca
+# costa circa un quinto e resta piu' che sufficiente per rispondere
+# alla sola domanda "c'e' o non c'e' eco".
+PROBE_DECIMATION = 4
+# Sospetto: sopra questo valore nel controllo rapido si torna
+# all'analisi completa. Volutamente piu' basso della soglia vera, per
+# non rischiare di restare sospesi mentre l'eco e' tornata.
+PROBE_CORRELATION = 0.15
+# Sotto questo livello il riferimento e' silenzio: da un confronto con
+# il silenzio non si impara nulla, quindi non fa testo.
+REFERENCE_ACTIVE_RMS = 0.005
 
 # Soglie della modalita' "bilanciata": si scarta solo quando la
 # somiglianza e' netta, per non perdere gli interventi reali.
@@ -111,7 +135,22 @@ class ReferenceBuffer:
         self.max_samples = int(max_seconds * sample_rate)
         self._data = np.zeros(0, dtype=np.float32)
         self._base_offset = 0.0
+        self._known_until = 0.0
         self.active = False
+
+    def note_silence(self, until: float) -> None:
+        """
+        Registra che il canale e' stato analizzato fino a un certo
+        istante senza che nessuno parlasse.
+
+        Anche l'assenza di suono e' un riferimento valido: senza questa
+        informazione, ogni frase del selezionatore pronunciata mentre il
+        candidato tace resterebbe in attesa di un riferimento che non
+        arrivera' mai.
+        """
+        if until > self._known_until:
+            self._known_until = until
+            self.active = True
 
     def append(self, offset: float, samples: np.ndarray) -> None:
         if samples.size == 0:
@@ -152,7 +191,8 @@ class ReferenceBuffer:
         return self._base_offset + self._data.size / self.sample_rate
 
     def covers(self, until: float) -> bool:
-        return self._data.size > 0 and self.end_offset >= until
+        fine = self.end_offset if self._data.size else 0.0
+        return max(fine, self._known_until) >= until
 
     def segment(self, start: float, duration: float) -> tuple[np.ndarray, int] | None:
         """
@@ -205,7 +245,10 @@ def _slice_padded(array: np.ndarray, start: int, length: int) -> np.ndarray:
 
 
 def _normalised_cross_correlation(
-    mic: np.ndarray, reference: np.ndarray, pre_samples: int
+    mic: np.ndarray,
+    reference: np.ndarray,
+    pre_samples: int,
+    max_lag_samples: int | None = None,
 ) -> tuple[float, int, float]:
     """
     Somiglianza massima fra microfono e riferimento al variare del
@@ -241,6 +284,8 @@ def _normalised_cross_correlation(
     correlation = np.fft.irfft(spectrum_mic * np.conj(spectrum_ref), size)
 
     max_lag = min(correlation.size - 1, reference.size - 1)
+    if max_lag_samples is not None:
+        max_lag = min(max_lag, max(1, max_lag_samples))
     window = correlation[: max_lag + 1]
     if window.size == 0:
         return 0.0, 0, 0.0
@@ -346,10 +391,63 @@ class EchoProcessor:
         # permette di ripulire anche i blocchi in cui l'eco e' coperta
         # dalla voce del selezionatore e la misura sarebbe inaffidabile.
         self._stable_lag: int | None = None
+        # Stato del riconoscimento "cuffie": vedi le costanti in cima.
+        self._quiet_streak = 0
+        self._sleeping = False
 
     @property
     def enabled(self) -> bool:
         return self.mode in (MODE_AUTO, MODE_CANCEL)
+
+    @property
+    def dormant(self) -> bool:
+        """True quando l'analisi e' sospesa perche' non si rileva eco."""
+        return self._sleeping
+
+    def _note_quiet(self, reference_active: bool) -> None:
+        if not reference_active:
+            return
+        self._quiet_streak += 1
+        if not self._sleeping and self._quiet_streak >= HEADPHONES_QUIET_UTTERANCES:
+            self._sleeping = True
+            log.info(
+                "Nessuna eco rilevata in %d frasi: sembra che si stiano usando "
+                "le cuffie. Passo al controllo rapido.",
+                self._quiet_streak,
+            )
+
+    def _note_active(self) -> None:
+        self._quiet_streak = 0
+        if self._sleeping:
+            self._sleeping = False
+            log.info("Eco nuovamente presente: riprendo l'analisi completa.")
+
+    def _probably_echoing(
+        self, mic: np.ndarray, reference: np.ndarray, pre_samples: int
+    ) -> bool:
+        """
+        Controllo rapido: c'e' motivo di fare l'analisi completa?
+
+        Un semplice contatore di frasi da saltare sarebbe stato piu'
+        economico, ma avrebbe lasciato passare decine di frasi di eco se
+        l'utente si sfila le cuffie a meta' colloquio. Qui invece ogni
+        frase viene comunque esaminata, solo a risoluzione ridotta.
+        """
+        passo = PROBE_DECIMATION
+        if mic.size < passo * 8 or reference.size < passo * 8:
+            return True
+
+        def riduci(x: np.ndarray) -> np.ndarray:
+            usable = (x.size // passo) * passo
+            # La media sui campioni scartati fa anche da filtro
+            # anti-aliasing: senza, la riduzione introdurrebbe un
+            # rumore che falserebbe il confronto.
+            return x[:usable].reshape(-1, passo).mean(axis=1).astype(np.float32)
+
+        correlation, _lag, _prom = _normalised_cross_correlation(
+            riduci(mic), riduci(reference), pre_samples // passo, None
+        )
+        return correlation >= PROBE_CORRELATION
 
     @property
     def speakers_detected(self) -> bool:
@@ -369,9 +467,25 @@ class EchoProcessor:
         if not self.enabled or reference is None or reference.size == 0:
             return EchoResult(mic, False, 0.0, 0.0)
 
+        # Analisi ridotta (cuffie): l'esame completo su una frase lunga
+        # costa quanto un decimo della trascrizione, e ripeterlo per
+        # tutto il colloquio senza mai trovare nulla e' tempo tolto ai
+        # sottotitoli.
+        if self._sleeping and not self._probably_echoing(mic, reference, pre_samples):
+            return EchoResult(mic, False, 0.0, 0.0)
+
+        reference_active = (
+            float(np.sqrt(np.mean(np.square(reference, dtype=np.float64))))
+            >= REFERENCE_ACTIVE_RMS
+        )
+
         self.processed += 1
+        # Il ritardo dell'eco non puo' superare i limiti fisici: cercare
+        # oltre non serve e apre la porta a somiglianze casuali che
+        # farebbero scartare frasi vere del selezionatore.
+        limite = pre_samples + int(FORWARD_MARGIN_SECONDS * self.sample_rate)
         correlation, lag, prominence = _normalised_cross_correlation(
-            mic, reference, pre_samples
+            mic, reference, pre_samples, limite
         )
         self.last_correlation = correlation
 
@@ -396,13 +510,22 @@ class EchoProcessor:
             if self.mode == MODE_CANCEL
             else CORRELATION_MIN_INTEREST
         )
+        if correlation < CORRELATION_MIN_INTEREST:
+            self._note_quiet(reference_active)
+        else:
+            self._note_active()
+
         if correlation < floor:
             # Nessuna somiglianza: il microfono sta registrando altro,
             # quasi certamente la voce del selezionatore.
             return EchoResult(mic, False, correlation, delay)
 
         if self.mode == MODE_AUTO:
-            is_echo = correlation >= CORRELATION_ECHO
+            # Non basta che la somiglianza sia alta: deve anche esserci
+            # un massimo netto a un ritardo preciso. Su una curva piatta
+            # un valore alto e' una coincidenza, e scartare il blocco
+            # farebbe sparire dalla trascrizione una domanda vera.
+            is_echo = correlation >= CORRELATION_ECHO and prominence >= PROMINENCE_MIN
             if is_echo:
                 self.detections += 1
             return EchoResult(mic, is_echo, correlation, delay)
@@ -441,7 +564,16 @@ class EchoProcessor:
         # Se dopo la sottrazione resta pochissimo, il blocco conteneva
         # solo eco; altrimenti cio' che resta e' voce vera e va
         # trascritta, ora ripulita dall'eco.
-        is_echo = ratio < RESIDUAL_ENERGY_RATIO or residual_rms < RESIDUAL_RMS_FLOOR
+        #
+        # Scartare l'intero blocco e' pero' lecito solo se l'eco era
+        # davvero riconoscibile: quando i due parlano insieme la
+        # sottrazione toglie inevitabilmente troppo, e senza questa
+        # condizione la domanda del selezionatore sparirebbe proprio
+        # nei momenti piu' vivaci del colloquio.
+        eco_riconoscibile = correlation >= CORRELATION_ECHO
+        is_echo = eco_riconoscibile and (
+            ratio < RESIDUAL_ENERGY_RATIO or residual_rms < RESIDUAL_RMS_FLOOR
+        )
         if is_echo:
             self.detections += 1
             return EchoResult(mic, True, correlation, delay, True, attenuation)
