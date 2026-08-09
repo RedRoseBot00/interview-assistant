@@ -140,6 +140,18 @@ QPushButton#AccentButton {{
 QPushButton#AccentButton:hover {{ background: #1d4ed8; }}
 QPushButton#AccentButton:disabled {{ background: #b6c8ee; color: #eff4ff; }}
 
+QPushButton#DangerButton {{
+    background: #ffffff;
+    border: 1px solid #f0c2c2;
+    color: {DANGER};
+}}
+QPushButton#DangerButton:hover {{ background: #fdf2f2; }}
+QPushButton#DangerButton:disabled {{
+    background: #f7f8fa;
+    border-color: {BORDER};
+    color: #b9bec7;
+}}
+
 QPushButton:checked {{
     background: #dfe7f5;
     border-color: {ACCENT};
@@ -147,15 +159,40 @@ QPushButton:checked {{
 }}
 
 /* ---- Campi ---- */
-QLineEdit, QTextEdit, QComboBox, QSpinBox {{
+/* L'altezza minima e' indispensabile: senza, su Windows il campo si
+   adatta al testo con troppo poco margine e le lettere alte o con
+   accento risultano tagliate sopra e sotto. */
+QLineEdit, QComboBox, QSpinBox {{
     background: #ffffff;
     border: 1px solid {BORDER};
     border-radius: 7px;
-    padding: 7px 9px;
+    padding: 6px 9px;
+    min-height: 22px;
     selection-background-color: {ACCENT};
 }}
-QLineEdit:focus, QTextEdit:focus, QComboBox:focus {{ border-color: {ACCENT}; }}
-QTextEdit {{ padding: 9px; }}
+/* Il testo non deve toccare gli angoli arrotondati del riquadro. */
+QTextEdit, QPlainTextEdit {{
+    background: #ffffff;
+    border: 1px solid {BORDER};
+    border-radius: 7px;
+    padding: 6px 8px;
+    selection-background-color: {ACCENT};
+}}
+QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QComboBox:focus {{
+    border-color: {ACCENT};
+}}
+QComboBox::drop-down {{ border: none; width: 20px; }}
+QLabel {{ background: transparent; }}
+
+/* Il cronometro va letto con la coda dell'occhio mentre si parla con
+   il candidato: la regola generale sui caratteri lo riporterebbe alla
+   dimensione di tutto il resto, perche' in un foglio di stile Qt il
+   font impostato dal codice viene sempre sovrascritto. */
+#TimerLabel {{
+    font-size: 17px;
+    font-weight: 700;
+    color: {TEXT};
+}}
 
 /* ---- Liste ---- */
 QListWidget {{
@@ -186,7 +223,10 @@ QProgressBar {{
     background: #eef1f5;
     border: none;
     border-radius: 5px;
-    height: 9px;
+    /* In un foglio di stile Qt 'height' vale solo per i sottocontrolli:
+       sui widget serve la coppia minima/massima. */
+    min-height: 9px;
+    max-height: 9px;
     text-align: center;
     color: transparent;
 }}

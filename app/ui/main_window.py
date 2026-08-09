@@ -77,6 +77,8 @@ class MainWindow(QMainWindow):
         self.current_interview_id: int | None = None
         self._pending: dict = {}
         self._warnings: list[str] = []
+        self._streamed_report = False
+        self._stats_cache = ""
 
         db.init_db()
 
@@ -237,7 +239,9 @@ class MainWindow(QMainWindow):
         self.recording_dot = StatusDot(theme.TEXT_MUTED, 11)
         row.addWidget(self.recording_dot)
         self.timer_label = QLabel("00:00")
-        theme.bold(self.timer_label, 14)
+        # La dimensione arriva dal foglio di stile (#TimerLabel): un
+        # setFont qui verrebbe comunque sovrascritto dal QSS globale.
+        self.timer_label.setObjectName("TimerLabel")
         row.addWidget(self.timer_label)
         return row
 
@@ -403,7 +407,17 @@ class MainWindow(QMainWindow):
         for button in (self.export_docx_button, self.export_txt_button):
             button.setEnabled(False)
             buttons.addWidget(button)
+
         buttons.addStretch(1)
+        self.delete_report_button = QPushButton("Elimina report")
+        self.delete_report_button.setObjectName("DangerButton")
+        self.delete_report_button.setEnabled(False)
+        self.delete_report_button.setToolTip(
+            "Cancella il report generato. La trascrizione del colloquio "
+            "resta salvata e il report puo' essere rigenerato."
+        )
+        self.delete_report_button.clicked.connect(self._delete_report)
+        buttons.addWidget(self.delete_report_button)
         card.body().addLayout(buttons)
 
         layout.addWidget(card, 1)
@@ -465,8 +479,11 @@ class MainWindow(QMainWindow):
                 }[size],
                 size,
             )
-        index = self.model_combo.findData(settings.get("whisper_model_size", "small"))
-        self.model_combo.setCurrentIndex(max(0, index))
+        self._select_data(
+            self.model_combo,
+            settings.get("whisper_model_size"),
+            settings.DEFAULTS["whisper_model_size"],
+        )
 
         self.language_combo = QComboBox()
         self.language_combo.addItem("Rilevamento automatico", "auto")
@@ -475,10 +492,11 @@ class MainWindow(QMainWindow):
             ("fr", "Francese"), ("de", "Tedesco"), ("pt", "Portoghese"),
         ):
             self.language_combo.addItem(name, code)
-        index = self.language_combo.findData(
-            settings.get("transcription_language", "auto")
+        self._select_data(
+            self.language_combo,
+            settings.get("transcription_language"),
+            settings.DEFAULTS["transcription_language"],
         )
-        self.language_combo.setCurrentIndex(max(0, index))
 
         self.echo_combo = QComboBox()
         self.echo_combo.addItem(
@@ -492,8 +510,11 @@ class MainWindow(QMainWindow):
             "Avanzata — cancella l'eco e conserva le sovrapposizioni di voce",
             echo_module.MODE_CANCEL,
         )
-        index = self.echo_combo.findData(settings.get("echo_mode", echo_module.MODE_AUTO))
-        self.echo_combo.setCurrentIndex(max(0, index))
+        self._select_data(
+            self.echo_combo,
+            settings.get("echo_mode"),
+            settings.DEFAULTS["echo_mode"],
+        )
 
         self.mic_check = QCheckBox("Registra il microfono (la tua voce)")
         self.mic_check.setChecked(bool(settings.get("capture_microphone", True)))
@@ -532,8 +553,11 @@ class MainWindow(QMainWindow):
         self.cpu_combo.addItem("Automatica (consigliata)", "auto")
         self.cpu_combo.addItem("Compatibilita' — piu' lenta, sempre stabile", "compatible")
         self.cpu_combo.addItem("Prestazioni — piu' veloce, richiede CPU recente", "fast")
-        index = self.cpu_combo.findData(settings.get("cpu_mode", "auto"))
-        self.cpu_combo.setCurrentIndex(max(0, index))
+        self._select_data(
+            self.cpu_combo,
+            settings.get("cpu_mode"),
+            settings.DEFAULTS["cpu_mode"],
+        )
         caption = QLabel("Modalita' di calcolo")
         caption.setProperty("class", "Muted")
         right.add(caption)
@@ -730,6 +754,25 @@ class MainWindow(QMainWindow):
             self.candidate_input.setFocus()
             return
 
+        # Un report del colloquio precedente ancora in corso continuerebbe
+        # a scrivere nella schermata del nuovo, e non verrebbe mai
+        # salvato: per l'interfaccia quel colloquio non esiste piu'.
+        if self.report_worker is not None and self.report_worker.isRunning():
+            answer = QMessageBox.question(
+                self,
+                "Report ancora in corso",
+                "E' ancora in corso la generazione del report del colloquio "
+                "precedente. Avviando adesso un nuovo colloquio quel report "
+                "andrebbe perso.\n\nVuoi interromperlo e procedere?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+            self.report_worker.cancel()
+            self.report_worker.wait(5000)
+            self.report_worker = None
+
         self._release_session()
 
         self.transcript_view.clear()
@@ -742,6 +785,13 @@ class MainWindow(QMainWindow):
         self.export_docx_button.setEnabled(False)
         self.export_txt_button.setEnabled(False)
         self.report_button.setEnabled(False)
+        self.delete_report_button.setEnabled(False)
+        # I campi del candidato precedente vanno ripuliti: altrimenti le
+        # sue note e le sue competenze finirebbero salvate sul colloquio
+        # della persona successiva.
+        self.notes_edit.clear()
+        self.experience_input.clear()
+        self.skills_input.clear()
 
         self.session = InterviewSession(
             whisper_model_size=settings.get("whisper_model_size", "small"),
@@ -749,6 +799,11 @@ class MainWindow(QMainWindow):
             capture_system_audio=bool(settings.get("capture_system_audio", True)),
             language=settings.get("transcription_language", "auto"),
             echo_mode=settings.get("echo_mode", echo_module.MODE_AUTO),
+            # Con parent=None l'ultimo riferimento all'oggetto poteva
+            # restare in un thread di servizio, e il distruttore Qt
+            # sarebbe stato eseguito fuori dal thread grafico: causa
+            # nota di chiusure anomale sporadiche.
+            parent=self,
         )
         self.session.segment_received.connect(self._on_segment)
         self.session.level_changed.connect(self._on_level)
@@ -790,6 +845,14 @@ class MainWindow(QMainWindow):
         try:
             self.session.disconnect()
         except (RuntimeError, TypeError):
+            pass
+        # deleteLater fa distruggere l'oggetto dal ciclo di eventi
+        # grafico. Senza, l'ultimo riferimento poteva restare nel thread
+        # che ha eseguito l'arresto, e distruggere un oggetto Qt fuori
+        # dal proprio thread ha esito imprevedibile.
+        try:
+            self.session.deleteLater()
+        except RuntimeError:
             pass
         self.session = None
 
@@ -857,6 +920,8 @@ class MainWindow(QMainWindow):
             report="",
             segments=self._pending.get("segments", []),
             notes=self.notes_edit.toPlainText().strip(),
+            experience=self.experience_input.text().strip(),
+            skills=self.skills_input.text().strip(),
         )
         try:
             self.current_interview_id = db.save_interview(interview)
@@ -887,9 +952,17 @@ class MainWindow(QMainWindow):
                 "Nessuna trascrizione",
                 "Non e' stata registrata alcuna frase: non c'e' nulla da riassumere.",
             )
+            # Senza questa riga il pulsante restava grigio per sempre e
+            # l'utente non aveva modo di capire perche'.
+            self.report_button.setEnabled(True)
             return
 
         self.report_button.setEnabled(False)
+        # Anche l'eliminazione va bloccata: cancellare mentre il report
+        # si sta scrivendo lo faceva ricomparire pochi secondi dopo,
+        # perche' il processo in corso lo riscriveva a schermo e
+        # nell'archivio.
+        self.delete_report_button.setEnabled(False)
         self.status_label.setText(
             "Generazione del report in corso: richiede qualche minuto."
         )
@@ -909,13 +982,39 @@ class MainWindow(QMainWindow):
         self._keep_alive(self.report_worker)
         self.report_worker.finished_ok.connect(self._on_report_ready)
         self.report_worker.failed.connect(self._on_report_failed)
+        self.report_worker.partial.connect(self._on_report_partial)
+        self.report_view.clear()
+        self._streamed_report = False
         self.report_worker.start()
 
+    def _on_report_partial(self, pezzo: str) -> None:
+        """Mostra il report mentre viene scritto, invece che alla fine."""
+        # Un worker precedente puo' essere ancora vivo e continuare a
+        # inviare testo: scriverlo qui lo mescolerebbe al report attuale.
+        if self.sender() is not self.report_worker:
+            return
+        if not self._streamed_report:
+            self._streamed_report = True
+            self.status_label.setText("Il report si sta scrivendo...")
+            self.progress_bar.setVisible(False)
+        cursor = self.report_view.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        cursor.insertText(pezzo)
+        scrollbar = self.report_view.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
     def _on_report_ready(self, result) -> None:
+        if self.sender() is not self.report_worker:
+            log.info("Report di un colloquio precedente ignorato")
+            return
         self.progress_bar.setVisible(False)
         self.progress_bar.setRange(0, 100)
+        # Il testo definitivo sostituisce quello mostrato durante la
+        # scrittura: e' identico, ma cosi' eventuali frammenti persi per
+        # strada non restano nella schermata.
         self.report_view.setPlainText(result.text)
         self.report_button.setEnabled(True)
+        self.delete_report_button.setEnabled(bool(result.text.strip()))
 
         if self.current_interview_id is not None:
             try:
@@ -932,6 +1031,45 @@ class MainWindow(QMainWindow):
                 "Il modello linguistico non e' stato utilizzabile: e' stato "
                 f"prodotto un resoconto essenziale dalla trascrizione. {result.warning}"
             )
+
+    def _delete_report(self) -> None:
+        """Cancella il report mantenendo il colloquio e la sua trascrizione."""
+        if not self.report_view.toPlainText().strip():
+            return
+        if self.report_worker is not None and self.report_worker.isRunning():
+            QMessageBox.information(
+                self,
+                "Report in corso",
+                "Il report si sta ancora scrivendo: attendi che finisca "
+                "prima di eliminarlo.",
+            )
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Eliminare il report?",
+            "Il report verra' cancellato. La trascrizione del colloquio resta "
+            "salvata e potrai generare un nuovo report quando vuoi.\n\nProcedere?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        self.report_view.clear()
+        self.delete_report_button.setEnabled(False)
+
+        if self.current_interview_id is not None:
+            try:
+                db.update_report(self.current_interview_id, "", False)
+                self._refresh_history()
+            except Exception:
+                log.exception("Cancellazione del report non riuscita")
+                self._add_warning(
+                    "Il report e' stato tolto dalla schermata ma non "
+                    "dall'archivio: controlla i log."
+                )
+        self.status_label.setText("Report eliminato. Puoi generarne uno nuovo.")
 
     def _on_report_failed(self, message: str) -> None:
         self.progress_bar.setVisible(False)
@@ -994,14 +1132,30 @@ class MainWindow(QMainWindow):
 
         if self.is_recording:
             stats = self.session.statistics()
-            self.stats_label.setText(
+            testo = (
                 f"Interventi registrati: {stats['segments']} — "
                 f"domande poste: {stats['questions']} — "
                 f"parlato del candidato: {stats['candidate_share']}%"
             )
+            velocita = self.session.realtime_factor
+            if velocita:
+                testo += f" — trascrizione a {velocita:.1f}× il tempo reale"
+            # Riscrivere l'etichetta solo quando cambia evita un
+            # ridisegno al secondo, che su un computer modesto si nota.
+            if testo != self._stats_cache:
+                self._stats_cache = testo
+                self.stats_label.setText(testo)
+
             if self.session.speakers_detected and not self.echo_chip.isVisible():
                 self.echo_chip.setText("Altoparlanti rilevati — eco gestita")
                 self.echo_chip.setVisible(True)
+
+            arretrato = self.session.pending_chunks
+            if arretrato >= 4:
+                self._add_warning(
+                    "La trascrizione non sta al passo del parlato: nelle "
+                    "impostazioni puoi scegliere un modello piu' leggero."
+                )
 
     def _refresh_platform(self) -> None:
         if self.platform_probe is not None and self.platform_probe.isRunning():
@@ -1044,8 +1198,36 @@ class MainWindow(QMainWindow):
         settings.set("always_on_top", bool(enabled))
         self.setWindowFlag(Qt.WindowStaysOnTopHint, bool(enabled))
         self.show()
-        if hasattr(self, "call_view"):
+        if not hasattr(self, "call_view"):
+            return
+        # Su Windows cambiare i flag di una finestra principale la fa
+        # ricreare: l'identificativo nativo cambia. L'anteprima della
+        # videochiamata era pero' agganciata a quello vecchio, quindi
+        # spariva e non tornava piu'. Va riagganciata alla finestra
+        # nuova, non semplicemente ridisegnata.
+        sorgente = getattr(self.call_view, "source", None)
+        if sorgente is not None:
+            self.call_view.set_source(sorgente)
+        else:
             self.call_view.refresh()
+
+    @staticmethod
+    def _select_data(combo, value, fallback) -> None:
+        """
+        Seleziona un valore nel menu a tendina, con ripiego esplicito.
+
+        Il vecchio max(0, indice) ripiegava sul PRIMO elemento: se il
+        file delle impostazioni conteneva un valore non piu' previsto,
+        la schermata mostrava "Rilevamento automatico" mentre il
+        programma continuava a usare di nascosto il valore vecchio.
+        """
+        index = combo.findData(value)
+        if index < 0:
+            log.warning(
+                "Valore '%s' non presente nel menu: uso '%s'", value, fallback
+            )
+            index = max(0, combo.findData(fallback))
+        combo.setCurrentIndex(index)
 
     @staticmethod
     def _restyle(widget: QWidget) -> None:
@@ -1058,12 +1240,29 @@ class MainWindow(QMainWindow):
     def _export(self, fmt: str) -> None:
         if self.current_interview_id is None:
             return
-        interview = db.get_interview(self.current_interview_id)
+        # Un'eccezione dentro uno slot Qt non fa cadere il programma ma
+        # non produce nemmeno alcun effetto: senza questa protezione il
+        # pulsante sembrava semplicemente non funzionare.
+        try:
+            interview = db.get_interview(self.current_interview_id)
+        except Exception:
+            log.exception("Lettura del colloquio non riuscita")
+            self._add_warning(
+                "Non e' stato possibile leggere il colloquio dall'archivio."
+            )
+            return
         if interview is None:
             return
         interview.notes = self.notes_edit.toPlainText().strip()
+        interview.experience = self.experience_input.text().strip()
+        interview.skills = self.skills_input.text().strip()
         try:
-            db.update_notes(interview.id, interview.notes)
+            db.update_notes(
+                interview.id,
+                interview.notes,
+                experience=interview.experience,
+                skills=interview.skills,
+            )
         except Exception:
             log.exception("Salvataggio delle note non riuscito")
         self._write_export(interview, fmt)
@@ -1092,8 +1291,14 @@ class MainWindow(QMainWindow):
             self._open_folder(path.parent)
 
     def _refresh_history(self) -> None:
+        try:
+            colloqui = db.list_interviews()
+        except Exception:
+            log.exception("Lettura dell'archivio non riuscita")
+            self._add_warning("L'archivio dei colloqui non e' leggibile.")
+            return
         self.history_list.clear()
-        for interview in db.list_interviews():
+        for interview in colloqui:
             item = QListWidgetItem(
                 f"{interview.display_date}  —  {interview.candidate_name}"
                 + (f"  ({interview.role})" if interview.role else "")
@@ -1105,13 +1310,26 @@ class MainWindow(QMainWindow):
         item = self.history_list.currentItem()
         if item is None:
             return None
-        return db.get_interview(item.data(Qt.UserRole))
+        try:
+            return db.get_interview(item.data(Qt.UserRole))
+        except Exception:
+            log.exception("Lettura del colloquio selezionato non riuscita")
+            self._add_warning("Il colloquio selezionato non e' leggibile.")
+            return None
 
     def _show_history_item(self, current, _previous=None) -> None:
         if current is None:
             self.history_detail.clear()
             return
-        interview = db.get_interview(current.data(Qt.UserRole))
+        try:
+            interview = db.get_interview(current.data(Qt.UserRole))
+        except Exception:
+            log.exception("Lettura del colloquio non riuscita")
+            self.history_detail.setPlainText(
+                "Questo colloquio non e' leggibile dall'archivio. "
+                "Il dettaglio dell'errore e' nel file di log."
+            )
+            return
         if interview is None:
             return
 
@@ -1261,6 +1479,14 @@ class MainWindow(QMainWindow):
                 log.warning(
                     "Attesa prolungata di %s alla chiusura", type(worker).__name__
                 )
-                worker.wait()
+                # Mai un'attesa senza limite di tempo: bloccherebbe il
+                # thread grafico e Windows dichiarerebbe la finestra
+                # "non risponde", senza alcuna via d'uscita per l'utente.
+                if not worker.wait(3000):
+                    log.error(
+                        "%s non si e' fermato: lo termino", type(worker).__name__
+                    )
+                    worker.terminate()
+                    worker.wait(2000)
 
         event.accept()

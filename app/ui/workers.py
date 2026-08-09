@@ -5,6 +5,7 @@ modelli all'avvio e generazione del report finale.
 from __future__ import annotations
 
 import logging
+import threading
 
 from PySide6.QtCore import QThread, Signal
 
@@ -28,6 +29,23 @@ class StartupWorker(QThread):
     def __init__(self, whisper_size: str, parent=None):
         super().__init__(parent)
         self.whisper_size = whisper_size
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        """
+        Interrompe davvero il lavoro in corso.
+
+        Il solo requestInterruption() di Qt non basta: viene consultato
+        soltanto fra una fase e l'altra, mentre lo scaricamento dei
+        modelli dura minuti. Chi chiudeva la finestra durante il primo
+        avvio si ritrovava la finestra bloccata finche' il download non
+        finiva — o per sempre, se la rete si impuntava.
+        """
+        self._cancel.set()
+        self.requestInterruption()
+
+    def _stopped(self) -> bool:
+        return self._cancel.is_set() or self.isInterruptionRequested()
 
     def run(self) -> None:  # noqa: D401 - metodo di QThread
         try:
@@ -43,9 +61,10 @@ class StartupWorker(QThread):
                     on_progress=lambda name, done, total: self.progress.emit(
                         name, done, total
                     ),
+                    should_stop=self._stopped,
                 )
 
-            if self.isInterruptionRequested():
+            if self._stopped():
                 return
 
             state = settings.get("engine_selftest", "")
@@ -56,6 +75,8 @@ class StartupWorker(QThread):
 
             self.stage.emit("Verifica della compatibilita' con il processore...")
             result = diagnostics.run_transcription_selftest(self.whisper_size)
+            if self._stopped():
+                return
 
             settings.set_many(
                 {
@@ -64,7 +85,7 @@ class StartupWorker(QThread):
                 }
             )
 
-            if self.isInterruptionRequested():
+            if self._stopped():
                 return
 
             if result.ok:
@@ -82,11 +103,14 @@ class StartupWorker(QThread):
                     "computer. Le funzioni di registrazione sono disattivate.",
                     result.detail,
                 )
+        except model_download.DownloadCancelled:
+            log.info("Preparazione interrotta dall'utente")
         except model_download.DownloadError as exc:
             self.failed.emit(str(exc), "")
         except Exception as exc:
             log.exception("Preparazione dell'applicazione non riuscita")
-            self.failed.emit(f"Preparazione non riuscita: {exc}", "")
+            if not self._stopped():
+                self.failed.emit(f"Preparazione non riuscita: {exc}", "")
 
 
 class ReportWorker(QThread):
@@ -100,6 +124,7 @@ class ReportWorker(QThread):
 
     finished_ok = Signal(object)   # ReportResult
     failed = Signal(str)
+    partial = Signal(str)          # testo prodotto finora, pezzo per pezzo
 
     def __init__(
         self,
@@ -138,7 +163,11 @@ class ReportWorker(QThread):
         try:
             from app.summarization.llm import generate_report
 
-            result = generate_report(**self._args)
+            def _partial(pezzo: str) -> None:
+                if not self.isInterruptionRequested():
+                    self.partial.emit(pezzo)
+
+            result = generate_report(on_partial=_partial, **self._args)
             if not self.isInterruptionRequested():
                 self.finished_ok.emit(result)
         except Exception as exc:
@@ -158,10 +187,20 @@ class PlatformProbe(QThread):
 
     result = Signal(object)
 
+    def cancel(self) -> None:
+        """
+        Presente perche' chi chiude la finestra tratta tutti i worker
+        allo stesso modo: senza, questo finiva nel ramo di attesa senza
+        limite di tempo.
+        """
+        self.requestInterruption()
+
     def run(self) -> None:  # noqa: D401 - metodo di QThread
         try:
             from app import platform_detect
 
-            self.result.emit(platform_detect.detect())
+            risultato = platform_detect.detect()
+            if not self.isInterruptionRequested():
+                self.result.emit(risultato)
         except Exception:
             log.debug("Rilevamento piattaforma fallito", exc_info=True)

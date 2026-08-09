@@ -17,7 +17,6 @@ import time
 
 from PySide6.QtCore import QObject, Signal
 
-from app import config
 from app.audio.capture import AudioError, AudioRecorder
 from app.transcription.engine import TranscriptionEngine, TranscriptSegment
 
@@ -55,6 +54,7 @@ class InterviewSession(QObject):
         self._stopping = False
         self._stop_requested = False
         self.clean_shutdown = True
+        self._warnings_shown = 0
 
         self.recorder = AudioRecorder(
             capture_microphone=capture_microphone,
@@ -128,6 +128,7 @@ class InterviewSession(QObject):
 
             for message in self.recorder.warnings:
                 self.warning_raised.emit(message)
+            self._warnings_shown = len(self.recorder.warnings)
 
             self._started_at = time.monotonic()
             self.engine.start(self.recorder.audio_queue)
@@ -181,6 +182,19 @@ class InterviewSession(QObject):
 
     def _stop_blocking(self) -> None:
         clean = True
+
+        # L'ordine conta: prima si fermano le sorgenti audio, poi il
+        # motore. Chiudendo il motore per primo, l'ultima frase del
+        # colloquio — che il rilevatore di voce consegna proprio quando
+        # gli stream si chiudono — finirebbe in una coda che nessuno
+        # legge piu', e sparirebbe dal report.
+        try:
+            if not self.recorder.stop():
+                clean = False
+        except Exception:
+            clean = False
+            log.exception("Errore nella chiusura dei dispositivi audio")
+
         try:
             if not self.engine.stop():
                 clean = False
@@ -192,14 +206,10 @@ class InterviewSession(QObject):
             clean = False
             log.exception("Errore nella chiusura del motore di trascrizione")
 
-        try:
-            if not self.recorder.stop():
-                clean = False
-        except Exception:
-            clean = False
-            log.exception("Errore nella chiusura dei dispositivi audio")
-
-        for message in self.recorder.warnings:
+        # Gli avvisi gia' mostrati all'avvio non vanno ripetuti.
+        nuovi = self.recorder.warnings[self._warnings_shown :]
+        self._warnings_shown = len(self.recorder.warnings)
+        for message in nuovi:
             self.warning_raised.emit(message)
 
         self.clean_shutdown = clean
@@ -235,6 +245,11 @@ class InterviewSession(QObject):
         """True quando l'app ha riconosciuto l'eco degli altoparlanti."""
         return self.engine.speakers_detected
 
+    @property
+    def realtime_factor(self) -> float:
+        """Quante volte il tempo reale riesce a trascrivere il computer."""
+        return self.engine.realtime_factor
+
     def segments(self) -> list[dict]:
         return self.engine.segments_as_dicts()
 
@@ -242,17 +257,12 @@ class InterviewSession(QObject):
         return self.engine.full_transcript(labels)
 
     def statistics(self) -> dict:
-        """Numeri utili da mostrare accanto alle note."""
-        segments = self.segments()
-        recruiter = [s for s in segments if s["speaker"] == config.SPEAKER_RECRUITER]
-        candidate = [s for s in segments if s["speaker"] == config.SPEAKER_CANDIDATE]
-        recruiter_words = sum(len(s["text"].split()) for s in recruiter)
-        candidate_words = sum(len(s["text"].split()) for s in candidate)
-        total = recruiter_words + candidate_words
-        return {
-            "questions": sum(1 for s in recruiter if "?" in s["text"]),
-            "recruiter_words": recruiter_words,
-            "candidate_words": candidate_words,
-            "candidate_share": round(100 * candidate_words / total) if total else 0,
-            "segments": len(segments),
-        }
+        """
+        Numeri utili da mostrare accanto alle note.
+
+        Il calcolo e' tenuto aggiornato dal motore man mano che le frasi
+        arrivano: qui non si scorre nulla. Prima veniva rifatto da capo
+        una volta al secondo su tutti i segmenti, e dopo mezz'ora di
+        colloquio l'interfaccia cominciava a farsi pesante.
+        """
+        return self.engine.statistics()
