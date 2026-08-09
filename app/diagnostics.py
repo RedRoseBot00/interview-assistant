@@ -19,6 +19,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -29,10 +30,39 @@ StopFn = Optional[Callable[[], bool]]
 
 log = logging.getLogger(__name__)
 
-# Caricare un modello 'small' e trascrivere un secondo di audio richiede
-# molto meno; un'attesa piu' lunga significherebbe solo tenere l'utente
-# davanti a una schermata ferma dopo un errore grave del processo figlio.
-SELFTEST_TIMEOUT_SECONDS = 180
+# Tempo massimo del test, per dimensione del modello.
+#
+# Un valore unico era sbagliato: 'medium' pesa dieci volte 'base' e,
+# su un portatile con disco lento, caricarlo e farlo girare una volta
+# puo' superare abbondantemente i tre minuti. Il test scadeva, e
+# all'utente veniva detto che il motore "non riesce ad avviarsi su
+# questo computer" — con le funzioni di registrazione disattivate — per
+# il solo fatto di aver scelto un modello piu' grande.
+SELFTEST_TIMEOUT_SECONDS = {
+    "tiny": 180,
+    "base": 240,
+    "small": 420,
+    "medium": 900,
+}
+SELFTEST_TIMEOUT_DEFAULT = 300
+
+# Codici usati internamente per distinguere i modi di fallire.
+EXIT_MODEL_MISSING = 3
+EXIT_CANCELLED = -97
+EXIT_LAUNCH_FAILED = -98
+EXIT_TIMEOUT = -99
+
+_MOTIVI = {
+    EXIT_TIMEOUT: (
+        "il controllo preventivo ha impiegato troppo tempo su questo "
+        "computer (il modello scelto e' pesante)"
+    ),
+    EXIT_MODEL_MISSING: (
+        "il modello di trascrizione scelto non risulta ancora scaricato "
+        "per intero"
+    ),
+    EXIT_LAUNCH_FAILED: "non e' stato possibile avviare il controllo preventivo",
+}
 
 # Codici di uscita che indicano una terminazione da parte del sistema
 # operativo, non un errore del programma. Solo questi giustificano il
@@ -68,9 +98,19 @@ class SelfTestResult:
     ok: bool
     compatible_mode: bool     # True se serve la modalita' compatibilita'
     detail: str
+    # Vero quando il test non ha potuto concludersi (tempo scaduto,
+    # modello non ancora scaricato, impossibile avviare il processo).
+    # NON e' la stessa cosa di "il motore non funziona": in questi casi
+    # la registrazione va lasciata disponibile, perche' il piu' delle
+    # volte funziona benissimo — e' solo il controllo preventivo a non
+    # aver dato una risposta.
+    inconclusive: bool = False
+    reason: str = ""
 
     @property
     def state(self) -> str:
+        if self.inconclusive:
+            return ""
         if not self.ok:
             return "failed"
         return "ok-compatible" if self.compatible_mode else "ok"
@@ -124,25 +164,47 @@ def _run_child(
             creationflags=creationflags,
         )
     except Exception as exc:  # pragma: no cover
-        return -98, f"Impossibile eseguire il test di avvio: {exc}"
+        return EXIT_LAUNCH_FAILED, f"Impossibile eseguire il test di avvio: {exc}"
 
-    scadenza = time.monotonic() + SELFTEST_TIMEOUT_SECONDS
+    # L'uscita del figlio va SVUOTATA di continuo, in un thread a parte.
+    # Sorvegliare il processo senza leggere il tubo sembra innocuo, ma
+    # su Windows quel tubo tiene solo poche decine di kilobyte: quando
+    # si riempie il figlio si blocca in scrittura, non termina mai, e il
+    # test scade — facendo dichiarare guasto un motore perfettamente
+    # funzionante, solo perche' era stato loquace.
+    raccolto: list[str] = []
+
+    def _svuota() -> None:
+        try:
+            if proc.stdout is not None:
+                for riga in proc.stdout:
+                    raccolto.append(riga)
+                    if len(raccolto) > 400:
+                        del raccolto[:200]
+        except Exception:
+            log.debug("Lettura dell'uscita del test non riuscita", exc_info=True)
+
+    lettore = threading.Thread(target=_svuota, name="selftest-out", daemon=True)
+    lettore.start()
+
+    massimo = SELFTEST_TIMEOUT_SECONDS.get(whisper_size, SELFTEST_TIMEOUT_DEFAULT)
+    scadenza = time.monotonic() + massimo
     while proc.poll() is None:
         if should_stop is not None and should_stop():
             proc.kill()
-            proc.communicate(timeout=10)
-            return -97, "Test di avvio interrotto su richiesta."
+            lettore.join(timeout=5)
+            return EXIT_CANCELLED, "Test di avvio interrotto su richiesta."
         if time.monotonic() > scadenza:
             proc.kill()
-            proc.communicate(timeout=10)
-            return -99, "Il test di avvio non si e' concluso entro il tempo massimo."
+            lettore.join(timeout=5)
+            return EXIT_TIMEOUT, (
+                f"Il test non si e' concluso entro {massimo} secondi. "
+                + "".join(raccolto[-40:]).strip()
+            )
         time.sleep(0.1)
 
-    try:
-        output, _ = proc.communicate(timeout=15)
-    except Exception:
-        output = ""
-    return proc.returncode, (output or "").strip()
+    lettore.join(timeout=15)
+    return proc.returncode, "".join(raccolto).strip()
 
 
 def run_transcription_selftest(
@@ -165,19 +227,32 @@ def run_transcription_selftest(
         attempts = [True] if compat.is_emulated() else [False, True]
 
     last_detail = ""
+    last_code = 0
     for index, force_generic in enumerate(attempts):
         log.info(
             "Test di avvio del motore di trascrizione (compatibilita'=%s)",
             force_generic,
         )
         code, detail = _run_child(force_generic, whisper_size, should_stop)
-        last_detail = detail
+        last_detail, last_code = detail, code
         if code == 0:
             log.info("Test superato (compatibilita'=%s)", force_generic)
             return SelfTestResult(True, force_generic, detail)
-        if code == -97:
-            return SelfTestResult(False, False, detail)
+        if code == EXIT_CANCELLED:
+            return SelfTestResult(
+                False, False, detail, inconclusive=True, reason="annullato"
+            )
         log.warning("Test fallito con codice %s: %s", code, detail[:2000])
+
+        # Tempo scaduto, modello non ancora presente, processo non
+        # avviabile: il test non ha dato una risposta. Non e' un verdetto
+        # di incompatibilita', e riprovare in modalita' compatibilita'
+        # non cambierebbe nulla.
+        if code in (EXIT_TIMEOUT, EXIT_MODEL_MISSING, EXIT_LAUNCH_FAILED):
+            return SelfTestResult(
+                False, False, detail, inconclusive=True,
+                reason=_MOTIVI.get(code, "non concluso"),
+            )
 
         # Il ripiego sui kernel generici ha senso solo se il processo
         # figlio e' stato ucciso dal sistema operativo. Se invece si e'
@@ -193,6 +268,15 @@ def run_transcription_selftest(
             )
             break
 
+    # Un'eccezione Python nel figlio (codice 1) non e' un verdetto sulla
+    # CPU: il piu' delle volte e' un file del modello incompleto o un
+    # problema momentaneo. Lo trattiamo come "non concluso" e lasciamo
+    # la registrazione disponibile, invece di bloccare il programma.
+    if not _is_native_crash(last_code):
+        return SelfTestResult(
+            False, False, last_detail, inconclusive=True,
+            reason="il controllo preventivo si e' interrotto con un errore",
+        )
     return SelfTestResult(False, False, last_detail)
 
 

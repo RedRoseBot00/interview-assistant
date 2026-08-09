@@ -23,7 +23,7 @@ log = logging.getLogger(__name__)
 # porta dietro il valore salvato dalla versione precedente, e senza
 # questo meccanismo continuerebbe a usare per sempre una taratura che
 # nel frattempo abbiamo scoperto essere sbagliata.
-TUNING_REVISION = 3
+TUNING_REVISION = 4
 
 # Impostazioni scelte dal programma, non dall'utente: sono quelle che
 # il cambio di revisione azzera.
@@ -41,17 +41,22 @@ def _default_model_size() -> str:
     """
     Modello proposto alla prima installazione, in base al processore.
 
-    Su un computer con pochi core il modello 'piccolo' non riesce a
-    stare al passo del parlato e la trascrizione accumula ritardo fino
-    a perdere pezzi: meglio partire da uno piu' rapido, l'utente potra'
-    sempre alzarlo dalle impostazioni.
+    La scelta e' cambiata dopo aver constatato sul campo che 'base'
+    trascrive l'inglese in modo accettabile ma l'italiano quasi sempre
+    male. Non e' un caso: Whisper e' addestrato per circa due terzi su
+    materiale inglese, e nei modelli piccoli la differenza fra le
+    lingue e' enorme. Un programma pensato per colloqui in italiano non
+    puo' partire dal modello che proprio in italiano non capisce.
+
+    'small' resta quindi il predefinito ovunque ci sia almeno un paio
+    di core veri; 'base' solo dove non c'e' alternativa. La velocita' se
+    ne occupa da sola: la profondita' della ricerca si adatta a quanto
+    il computer riesce a stare al passo (vedi engine._decoding_quality).
 
     Il conteggio va fatto sui core FISICI: un portatile a due core con
-    SMT ne dichiara quattro, e su quel numero il programma sceglieva
-    'small', che su quella macchina impiega tre o quattro volte il
-    tempo di 'base' senza guadagnare quasi nulla in precisione.
+    SMT ne dichiara quattro.
     """
-    return "base" if config._physical_cores() <= 2 else "small"
+    return "base" if config._physical_cores() < 2 else "small"
 
 
 DEFAULTS: dict[str, Any] = {

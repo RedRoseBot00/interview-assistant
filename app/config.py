@@ -11,7 +11,7 @@ from pathlib import Path
 
 APP_NAME = "InterviewAssistant"
 APP_DISPLAY_NAME = "Interview Assistant"
-APP_VERSION = "3.0.1"
+APP_VERSION = "3.1.0"
 
 # --------------------------------------------------------------------------
 # Percorsi applicazione
@@ -84,6 +84,35 @@ for _d in (MODELS_DIR, EXPORTS_DIR, LOG_DIR, WHISPER_CACHE_DIR):
 WHISPER_MODEL_SIZES = ("tiny", "base", "small", "medium")
 WHISPER_MODEL_SIZE_DEFAULT = "small"
 WHISPER_COMPUTE_TYPE = "int8"  # quantizzato: gira su CPU senza GPU dedicata
+
+# --------------------------------------------------------------------------
+# Qualita' della decodifica
+# --------------------------------------------------------------------------
+# Whisper prova a trascrivere e poi controlla il risultato: se il testo
+# e' troppo ripetitivo o poco sicuro, RIPROVA con una temperatura piu'
+# alta. Passandogli una temperatura singola quel meccanismo si spegne:
+# il primo tentativo viene tenuto anche quando fallisce i controlli,
+# cioe' proprio quando e' farfugliato.
+#
+# Il costo e' asimmetrico e conviene: sui blocchi riusciti al primo colpo
+# non si paga nulla, perche' i tentativi successivi non vengono
+# nemmeno eseguiti. Si paga solo dove il risultato sarebbe stato da
+# buttare — ed e' li' che serve. Sull'italiano, dove i modelli piccoli
+# entrano in ciclo di ripetizioni molto piu' spesso che sull'inglese,
+# questa e' la differenza fra una trascrizione leggibile e una inutile.
+DECODE_TEMPERATURES_FULL = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+DECODE_TEMPERATURES_FAST = (0.0, 0.4)
+
+# La ricerca a fascio esamina piu' trascrizioni possibili invece di
+# prendere sempre la parola piu' probabile. Costa tempo a OGNI blocco,
+# quindi viene alzata solo quando il computer sta comodamente al passo.
+DECODE_BEAM_MIN = 1
+DECODE_BEAM_MID = 3
+DECODE_BEAM_MAX = 5
+# Soglie sul rapporto fra durata dell'audio e tempo impiegato, con
+# isteresi per non oscillare fra una configurazione e l'altra.
+SPEED_RAISE_QUALITY = 2.5
+SPEED_LOWER_QUALITY = 1.3
 
 # --------------------------------------------------------------------------
 # Modello LLM locale per la generazione del report (no API, no costi)
