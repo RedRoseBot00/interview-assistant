@@ -29,6 +29,7 @@ import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from app import config
 
@@ -70,18 +71,18 @@ Durata: {duration}
 {transcript}
 --- FINE TRASCRIZIONE ---
 
-Scrivi un resoconto strutturato in {output_language}, con queste sezioni \
-numerate:
+Scrivi un resoconto in {output_language} con queste sezioni numerate:
 
-1. Sintesi del colloquio (3-5 frasi)
-2. Punti di forza emersi
-3. Aree di attenzione o da approfondire
-4. Competenze ed esperienze citate
-5. Domande di follow-up suggerite per un eventuale secondo colloquio
-6. Valutazione complessiva: scegli tra Positiva, Da approfondire, Negativa, \
-con una breve motivazione
+1. SINTESI — 3 frasi
+2. PUNTI DI FORZA — massimo 4 punti elenco, una riga ciascuno
+3. AREE DI ATTENZIONE — massimo 3 punti elenco, una riga ciascuno
+4. COMPETENZE CITATE — solo un elenco di parole chiave
+5. DOMANDE DI APPROFONDIMENTO — massimo 3
+6. VALUTAZIONE — Positiva, Da approfondire oppure Negativa, con una riga \
+di motivazione
 
-Basati esclusivamente su quanto detto nella trascrizione."""
+Sii asciutto e concreto: niente premesse, niente ripetizioni, nessun \
+commento sul tuo lavoro. Basati esclusivamente sulla trascrizione."""
 
 
 @dataclass
@@ -98,6 +99,59 @@ class ReportResult:
 _TRUNCATION_MARKER = (
     "\n\n[...parte centrale del colloquio omessa per limiti di lunghezza...]\n\n"
 )
+
+# Intercalari che da soli non aggiungono nulla a un resoconto. Vengono
+# tolti solo quando costituiscono l'intera battuta.
+_INTERCALARI = {
+    "si", "sì", "no", "ok", "okay", "certo", "esatto", "perfetto", "bene",
+    "mmm", "mhm", "ah", "eh", "beh", "allora", "ecco", "va bene", "d'accordo",
+    "yes", "yeah", "no", "right", "okay", "sure", "exactly", "perfect",
+}
+
+
+def compact_transcript(transcript: str) -> str:
+    """
+    Compatta la trascrizione senza perdere informazione.
+
+    Il tempo di lettura del modello cresce in proporzione alla lunghezza
+    del testo, e su un computer da ufficio quella lettura e' la meta'
+    dell'attesa totale. Una trascrizione automatica pero' e' piena di
+    ridondanza strutturale: la stessa persona compare su dieci righe di
+    seguito perche' il rilevatore di voce ha tagliato alle pause, e fra
+    una risposta e l'altra si accumulano battute di puro assenso.
+
+    Unendo le righe consecutive dello stesso interlocutore e togliendo
+    gli intercalari isolati si risparmia in genere un terzo del testo
+    senza togliere un solo contenuto: il modello legge meno, quindi
+    risponde prima, e non riceve nulla di meno su cui ragionare.
+    """
+    righe = [r.strip() for r in (transcript or "").splitlines()]
+    unite: list[tuple[str, list[str]]] = []
+
+    for riga in righe:
+        if not riga:
+            continue
+        etichetta, separatore, testo = riga.partition(":")
+        if not separatore:
+            etichetta, testo = "", riga
+        testo = testo.strip()
+        if not testo:
+            continue
+
+        nudo = testo.lower().strip(".,;:!? ")
+        if len(testo.split()) <= 2 and nudo in _INTERCALARI:
+            continue
+
+        if unite and unite[-1][0] == etichetta:
+            unite[-1][1].append(testo)
+        else:
+            unite.append((etichetta, [testo]))
+
+    fuse: list[str] = []
+    for etichetta, pezzi in unite:
+        corpo = " ".join(pezzi)
+        fuse.append(f"{etichetta}: {corpo}" if etichetta else corpo)
+    return "\n".join(fuse)
 
 
 def truncate_transcript(
@@ -140,6 +194,27 @@ def truncate_transcript(
     return head + _TRUNCATION_MARKER + tail, True
 
 
+def context_size_for(prompt: str, system: str, max_tokens: int) -> int:
+    """
+    Finestra di contesto adatta a questo preciso report.
+
+    Tenerla fissa a quattromila token significa allocare la memoria per
+    la cache delle chiavi e i buffer di calcolo sempre al massimo, anche
+    per un colloquio di dieci minuti. Su un portatile con quattro
+    gigabyte di memoria, con l'interfaccia e il modello di trascrizione
+    gia' residenti, e' proprio quella memoria in piu' a far cominciare
+    lo scambio su disco: da li' in avanti non conta piu' nient'altro.
+
+    La stima e' volutamente prudente (due caratteri per token contro i
+    tre e mezzo tipici dell'italiano): sbagliare per eccesso costa un
+    po' di memoria, sbagliare per difetto farebbe fallire il report.
+    """
+    caratteri = len(prompt) + len(system)
+    stima = int(caratteri / 2.0) + max_tokens + 256
+    arrotondato = ((stima + 255) // 256) * 256
+    return max(config.LLM_CONTEXT_MIN, min(config.LLM_CONTEXT_MAX, arrotondato))
+
+
 def _format_duration(seconds: float | None) -> str:
     try:
         seconds = max(0, int(seconds or 0))
@@ -160,7 +235,14 @@ def build_prompt(
     language_code: str,
 ) -> str:
     output_language = LANGUAGE_NAMES.get(language_code, "italiano")
-    body, truncated = truncate_transcript(transcript)
+    originale = len(transcript or "")
+    compatto = compact_transcript(transcript)
+    if originale and compatto:
+        log.info(
+            "Trascrizione compattata da %d a %d caratteri (-%.0f%%)",
+            originale, len(compatto), 100 * (1 - len(compatto) / originale),
+        )
+    body, truncated = truncate_transcript(compatto)
     if not body:
         body = "(nessuna trascrizione disponibile)"
     prompt = PROMPT_TEMPLATE.format(
@@ -321,6 +403,47 @@ def cancel_running_generation() -> None:
             log.debug("Interruzione del processo non riuscita", exc_info=True)
 
 
+def _read_stream(
+    proc: subprocess.Popen, on_partial: "Callable[[str], None] | None"
+) -> str:
+    """
+    Legge il testo prodotto dal processo figlio man mano che arriva.
+
+    Ogni riga e' un frammento in formato JSON: viene consegnato subito
+    all'interfaccia, cosi' il report compare parola per parola invece di
+    apparire tutto insieme alla fine.
+    """
+    raccolto: list[str] = []
+    try:
+        if proc.stdout is None:
+            return ""
+        for riga in proc.stdout:
+            riga = riga.strip()
+            if not riga:
+                continue
+            try:
+                pezzo = json.loads(riga).get("t", "")
+            except Exception:
+                # Riga non nostra (avviso di una libreria): la teniamo
+                # solo per l'eventuale diagnosi dell'errore.
+                raccolto.append(riga)
+                continue
+            if pezzo and on_partial:
+                try:
+                    on_partial(pezzo)
+                except Exception:
+                    log.debug("Aggiornamento parziale non riuscito", exc_info=True)
+    except Exception:
+        log.debug("Lettura del flusso interrotta", exc_info=True)
+    finally:
+        try:
+            if proc.stdout:
+                proc.stdout.close()
+        except Exception:
+            pass
+    return "\n".join(raccolto[-40:])
+
+
 def _safe_fallback(
     segments: list[dict],
     labels: dict[str, str],
@@ -357,6 +480,7 @@ def generate_report(
     duration_seconds: float = 0.0,
     detected_language: str = "it",
     report_language: str = "auto",
+    on_partial: "Callable[[str], None] | None" = None,
 ) -> ReportResult:
     """
     Produce il report. Non solleva eccezioni: in caso di problemi
@@ -394,7 +518,12 @@ def generate_report(
                     "system": SYSTEM_PROMPT,
                     "prompt": prompt,
                     "model_path": str(config.LLM_MODEL_PATH),
-                    "context_size": config.LLM_CONTEXT_SIZE,
+                    "context_size": context_size_for(
+                        prompt, SYSTEM_PROMPT, config.LLM_MAX_TOKENS
+                    ),
+                    "max_tokens": config.LLM_MAX_TOKENS,
+                    "batch_size": config.LLM_BATCH_SIZE,
+                    "threads": config.llm_threads(),
                 },
                 ensure_ascii=False,
             ),
@@ -405,29 +534,61 @@ def generate_report(
         if sys.platform == "win32":
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
+        # Il numero di thread lo decide il figlio, che sa quanti core
+        # fisici ci sono. Una variabile d'ambiente ereditata dal padre
+        # potrebbe solo contraddirlo: in passato la modalita'
+        # compatibilita' la fissava a 1 e dimezzava la generazione.
+        ambiente = dict(os.environ)
+        ambiente.pop("OMP_NUM_THREADS", None)
+
         global _active_child
         proc = subprocess.Popen(
             _child_command(input_path, output_path),
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            # Gli errori del processo figlio finiscono nel file di log
+            # condiviso: leggere due flussi contemporaneamente rischia di
+            # bloccarsi quando uno dei due si riempie.
+            stderr=subprocess.DEVNULL,
             text=True,
-            # Senza errors="replace" un output non decodificabile
-            # solleverebbe un'eccezione proprio quando serve leggere il
-            # messaggio d'errore del processo figlio.
+            # Senza errors="replace" un carattere non decodificabile
+            # interromperebbe la lettura a meta' generazione.
             errors="replace",
-            env=dict(os.environ),
+            env=ambiente,
             creationflags=creationflags,
         )
         with _child_lock:
             _active_child = proc
+
+        child_out = ""
         try:
-            child_out, child_err = proc.communicate(
-                timeout=GENERATION_TIMEOUT_SECONDS
+            # La lettura del flusso va sorvegliata: se il processo figlio
+            # si blocca senza chiudere l'uscita (memoria esaurita, disco
+            # che comincia a scambiare) un semplice ciclo di lettura non
+            # tornerebbe mai, e l'utente vedrebbe girare la barra di
+            # attesa all'infinito senza alcun messaggio.
+            esito: dict[str, str] = {}
+            lettore = threading.Thread(
+                target=lambda: esito.__setitem__(
+                    "out", _read_stream(proc, on_partial)
+                ),
+                name="report-stream",
+                daemon=True,
             )
+            lettore.start()
+            lettore.join(GENERATION_TIMEOUT_SECONDS)
+            if lettore.is_alive():
+                proc.kill()          # chiude l'uscita e sblocca il lettore
+                lettore.join(10)
+                raise subprocess.TimeoutExpired(
+                    proc.args, GENERATION_TIMEOUT_SECONDS
+                )
+            child_out = esito.get("out", "")
+            proc.wait(timeout=60)
         finally:
             with _child_lock:
                 _active_child = None
 
+        child_err = ""
         if proc.returncode == 0 and output_path.exists():
             data = json.loads(output_path.read_text(encoding="utf-8"))
             text = (data.get("text") or "").strip()
@@ -487,28 +648,105 @@ def generate_report(
 # --------------------------------------------------------------------------
 # Codice eseguito NEL processo figlio
 # --------------------------------------------------------------------------
+def _fit_prompt(llm, prompt: str, system: str, context: int, max_tokens: int) -> str:
+    """
+    Accorcia il testo, se serve, contando i token veri.
+
+    La lunghezza in caratteri e' solo una stima: nomi propri, sigle e
+    numeri si spezzano in molti piu' token del testo corrente. Qui il
+    conto lo fa il modello stesso, quindi il report non puo' piu'
+    fallire per un prompt fuori misura — che era il modo peggiore di
+    perdere il lavoro di un colloquio intero.
+    """
+    disponibili = context - max_tokens - 96      # margine per il formato chat
+    if disponibili <= 256:
+        return prompt
+
+    def conta(testo: str) -> int:
+        try:
+            return len(llm.tokenize(testo.encode("utf-8"), add_bos=False))
+        except Exception:
+            return len(testo) // 3
+
+    fissi = conta(system)
+    for _ in range(6):
+        if fissi + conta(prompt) <= disponibili:
+            return prompt
+        # Togliamo dal centro: l'inizio del colloquio (presentazione) e
+        # la fine (conclusioni) sono le parti piu' informative.
+        taglio = int(len(prompt) * 0.15)
+        meta = len(prompt) // 2
+        prompt = (
+            prompt[: meta - taglio // 2]
+            + _TRUNCATION_MARKER
+            + prompt[meta + taglio // 2 :]
+        )
+    log.warning("Prompt ancora lungo dopo sei riduzioni: procedo comunque")
+    return prompt
+
+
 def generate_report_child(input_path: str, output_path: str) -> int:
+    """
+    Genera il report e lo trasmette man mano che viene scritto.
+
+    Ogni pezzo di testo prodotto viene stampato subito su stdout, dove
+    il processo principale lo legge e lo mostra nella finestra: cosi'
+    l'utente vede il report formarsi invece di fissare una barra di
+    attesa per minuti. Il testo completo viene comunque salvato nel
+    file di uscita, che resta la fonte definitiva.
+    """
     try:
         payload = json.loads(Path(input_path).read_text(encoding="utf-8"))
 
         from llama_cpp import Llama
 
-        threads = max(1, (os.cpu_count() or 4) - 1)
+        threads = int(payload.get("threads") or max(1, (os.cpu_count() or 2)))
+        contesto = int(payload.get("context_size", 4096))
+        batch = int(payload.get("batch_size", 512))
+        max_tokens = int(payload.get("max_tokens", 450))
         llm = Llama(
             model_path=payload["model_path"],
-            n_ctx=int(payload.get("context_size", 8192)),
+            n_ctx=contesto,
             n_threads=threads,
+            n_threads_batch=threads,
+            n_batch=batch,
+            # Micro-lotto pari al lotto: su CPU la lettura del prompt
+            # procede a blocchi piu' grandi, con meno passaggi sui pesi.
+            n_ubatch=batch,
             verbose=False,
         )
-        result = llm.create_chat_completion(
+
+        prompt = _fit_prompt(llm, payload["prompt"], payload["system"],
+                             contesto, max_tokens)
+
+        pezzi: list[str] = []
+        flusso = llm.create_chat_completion(
             messages=[
                 {"role": "system", "content": payload["system"]},
-                {"role": "user", "content": payload["prompt"]},
+                {"role": "user", "content": prompt},
             ],
             temperature=0.3,
-            max_tokens=1500,
+            max_tokens=max_tokens,
+            # Senza un freno alle ripetizioni il modello, arrivato in
+            # fondo alle sezioni richieste, riempie lo spazio rimasto
+            # ripetendosi: minuti di attesa per testo inutile.
+            repeat_penalty=1.05,
+            stream=True,
         )
-        text = result["choices"][0]["message"]["content"].strip()
+        for blocco in flusso:
+            delta = blocco["choices"][0].get("delta", {}).get("content")
+            if not delta:
+                continue
+            pezzi.append(delta)
+            try:
+                sys.stdout.write(json.dumps({"t": delta}, ensure_ascii=False) + "\n")
+                sys.stdout.flush()
+            except Exception:
+                # Se il processo principale ha chiuso la lettura non e'
+                # un motivo per interrompere la generazione.
+                pass
+
+        text = "".join(pezzi).strip()
         Path(output_path).write_text(
             json.dumps({"text": text}, ensure_ascii=False), encoding="utf-8"
         )
