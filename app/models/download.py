@@ -15,6 +15,7 @@ cui preme "Avvia colloquio".
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 from pathlib import Path
 from typing import Callable, Optional
@@ -61,6 +62,25 @@ def _hf_url(repo: str, filename: str) -> str:
     return f"https://huggingface.co/{repo}/resolve/main/{filename}"
 
 
+def _remove_stale_parts(directory: Path) -> None:
+    """
+    Elimina i frammenti lasciati da download interrotti.
+
+    Un file ancora aperto da un altro processo non si lascia cancellare:
+    in quel caso l'errore viene ignorato, perche' significa
+    semplicemente che quel download e' tuttora in corso.
+    """
+    try:
+        for leftover in directory.glob("*.part"):
+            try:
+                leftover.unlink()
+                log.info("Rimosso frammento di download: %s", leftover.name)
+            except OSError:
+                log.debug("Frammento '%s' in uso, lo lascio", leftover.name)
+    except Exception:
+        log.debug("Pulizia dei frammenti non riuscita", exc_info=True)
+
+
 FILE_ASSENTE = -1        # il server risponde 404: il file non esiste
 DIMENSIONE_IGNOTA = -2   # non siamo riusciti a saperlo (rete, proxy, CDN)
 
@@ -102,7 +122,11 @@ def _download_file(
     un errore incomprensibile.
     """
     destination.parent.mkdir(parents=True, exist_ok=True)
-    tmp = destination.with_suffix(destination.suffix + ".part")
+    # Il file temporaneo porta il numero del processo: se due copie del
+    # programma partissero insieme, senza questo accorgimento si
+    # contenderebbero lo stesso file e Windows risponderebbe "il file e'
+    # utilizzato da un altro processo".
+    tmp = destination.with_suffix(f"{destination.suffix}.{os.getpid()}.part")
     written = 0
     try:
         with requests.get(url, stream=True, timeout=60) as resp:
@@ -165,6 +189,7 @@ def download_whisper_model(size: str, on_progress: ProgressFn = None) -> Path:
     repo = WHISPER_REPOS[size]
     target = whisper_model_dir(size)
     target.mkdir(parents=True, exist_ok=True)
+    _remove_stale_parts(target)
 
     # Le dimensioni servono solo per rendere veritiera la barra di
     # avanzamento. Se il server non le comunica, procediamo comunque:
