@@ -121,7 +121,13 @@ def _tame_peaks(samples: np.ndarray, ratio: float = 4.0) -> np.ndarray:
     """
     if samples.size == 0:
         return samples
-    livello = float(np.sqrt(np.mean(np.square(samples, dtype=np.float64))))
+    # Il livello di riferimento e' quello del tratto piu' sonoro, non la
+    # media dell'intera frase. Con la media, una frase nata da un
+    # accorpamento — che contiene per costruzione il silenzio delle
+    # pause — abbassava il riferimento al punto che il compressore
+    # entrava sulle sillabe vere: la resa del riconoscimento finiva per
+    # dipendere da quanto arretrato aveva la coda in quel momento.
+    livello = _loudest_rms(samples)
     if livello <= 0.0:
         return samples
     limite = ratio * livello
@@ -218,7 +224,9 @@ class TranscriptionEngine:
         # disposti a ricrederci.
         self._language_forced = language != "auto"
         self._language_votes: Counter[str] = Counter()
-        self._unlock_votes: Counter[str] = Counter()
+        # Sblocco: servono voti CONSECUTIVI sulla stessa lingua nuova.
+        self._unlock_candidate: Optional[str] = None
+        self._unlock_streak = 0
         self._probe_countdown = 0
 
         # Rapporto fra durata dell'audio e tempo impiegato a trascriverlo.
@@ -353,7 +361,14 @@ class TranscriptionEngine:
                 chunk = self._next_chunk(audio_queue, timeout=0.4)
             except queue.Empty:
                 self.backlog = len(self._waiting) + len(self._local)
-                self._flush_waiting(force=self._stop.is_set())
+                try:
+                    self._flush_waiting(force=self._stop.is_set())
+                except Exception as exc:
+                    log.exception("Errore nello smaltimento delle frasi in attesa")
+                    if self.on_error:
+                        self.on_error(exc)
+                    self._waiting.clear()
+                self._update_parked(audio_queue)
                 if self._stop.is_set() and not self._waiting:
                     break
                 continue
@@ -365,8 +380,18 @@ class TranscriptionEngine:
                 log.exception("Errore durante l'elaborazione di un blocco")
                 if self.on_error:
                     self.on_error(exc)
+            self._update_parked(audio_queue)
 
-        self._flush_waiting(force=True)
+        # Lo svuotamento finale va protetto quanto il resto: e' il
+        # momento in cui escono le ultime frasi del colloquio, e un
+        # errore qui le faceva sparire tutte in silenzio, per giunta
+        # senza mai segnalare la fine della trascrizione.
+        try:
+            self._flush_waiting(force=True)
+        except Exception as exc:
+            log.exception("Errore nello svuotamento finale")
+            if self.on_error:
+                self.on_error(exc)
         if self.echo_dropped or self.duplicates_dropped:
             log.info(
                 "Eco gestita: %d blocchi scartati sul segnale, %d frasi duplicate",
@@ -390,7 +415,9 @@ class TranscriptionEngine:
         self, audio_queue: "queue.Queue[AudioChunk]", timeout: float
     ) -> AudioChunk:
         if self._local:
-            return self._local.popleft()
+            blocco = self._local.popleft()
+            self._update_parked(audio_queue)
+            return blocco
         return audio_queue.get(timeout=timeout)
 
     def _fill_local(self, audio_queue: "queue.Queue[AudioChunk]") -> None:
@@ -399,6 +426,23 @@ class TranscriptionEngine:
                 self._local.append(audio_queue.get_nowait())
         except queue.Empty:
             pass
+        self._update_parked(audio_queue)
+
+    def _update_parked(self, audio_queue) -> None:
+        """
+        Dichiara alla coda quanti secondi di audio abbiamo in mano.
+
+        Il limite sull'arretrato vive nel thread di cattura e guarda il
+        contatore della coda. Estraendo fino a trentadue blocchi per
+        poterli accorpare, quel tempo spariva dal contatore: il limite
+        vedeva pochi secondi mentre il ritardo reale superava i cinque
+        minuti, e non scartava mai nulla.
+        """
+        if not hasattr(audio_queue, "parked_seconds"):
+            return
+        campioni = sum(c.samples.size for c in self._local)
+        campioni += sum(c.samples.size for c, _ in self._waiting)
+        audio_queue.parked_seconds = campioni / float(config.AUDIO_SAMPLE_RATE)
 
     def _merge_following(
         self, audio_queue: "queue.Queue[AudioChunk]", chunk: AudioChunk
@@ -423,6 +467,12 @@ class TranscriptionEngine:
         parti = [chunk.samples]
         fine = chunk.offset + chunk.samples.size / rate
         uniti = 0
+        # Silenzio aggiunto per ricostruire le pause. Va tenuto da parte:
+        # e' audio che non contiene parlato, e conteggiarlo come tale
+        # faceva passare per "frase lunga e sicura" un accorpamento di
+        # due monosillabi separati da un secondo di pausa — proprio le
+        # battute su cui non ci si deve fidare per decidere la lingua.
+        silenzio_aggiunto = 0.0
 
         # In arretrato conta solo smaltire: si accorpa anche attraverso
         # pause piu' lunghe, perche' una chiamata da venti secondi costa
@@ -451,9 +501,24 @@ class TranscriptionEngine:
                 break
 
             self._local.popleft()
+            campioni = successiva.samples
             if pausa > 0:
-                parti.append(np.zeros(int(pausa * rate), dtype=np.float32))
-            parti.append(successiva.samples)
+                riempimento = int(round(pausa * rate))
+                parti.append(np.zeros(riempimento, dtype=np.float32))
+                silenzio_aggiunto += riempimento / rate
+            elif pausa < 0:
+                # Le due frasi si sovrappongono: i campioni comuni vanno
+                # tolti, non incollati due volte. Concatenandoli si
+                # allungava la linea temporale a ogni accorpamento, e
+                # dopo venti giunzioni la finestra usata per cercare
+                # l'eco slittava di piu' del ritardo massimo cercabile.
+                doppi = min(int(round(-pausa * rate)), campioni.size)
+                campioni = campioni[doppi:]
+                if campioni.size == 0:
+                    fine = successiva.offset + successiva.samples.size / rate
+                    uniti += 1
+                    continue
+            parti.append(campioni)
             fine = successiva.offset + successiva.samples.size / rate
             uniti += 1
 
@@ -467,6 +532,7 @@ class TranscriptionEngine:
             chunk.offset,
             chunk.wall_time,
             chunk.continues_previous,
+            chunk.padding_seconds + silenzio_aggiunto,
         )
 
     # ------------------------------------------------------------------
@@ -523,6 +589,11 @@ class TranscriptionEngine:
                 )
                 if result.is_echo:
                     self.echo_dropped += 1
+                    # La frase scartata interrompe la catena: senza
+                    # questo azzeramento, la frase successiva marcata
+                    # come "seguito" veniva confrontata con un testo
+                    # vecchio di parecchi secondi e ne perdeva l'inizio.
+                    self._forget_last(chunk.speaker)
                     log.debug(
                         "Blocco microfono scartato come eco "
                         "(somiglianza %.2f, ritardo %.0f ms)",
@@ -539,6 +610,7 @@ class TranscriptionEngine:
                     chunk.offset,
                     chunk.wall_time,
                     chunk.continues_previous,
+                    chunk.padding_seconds,
                 )
             )
 
@@ -549,21 +621,28 @@ class TranscriptionEngine:
         if chunk.samples.size == 0 or self._model is None:
             return
 
-        # Ultimo controllo prima di impegnare il processore. Si misura il
-        # tratto piu' sonoro e non la media: ogni frase porta con se' un
-        # po' di silenzio all'inizio e alla fine, e la media abbasserebbe
-        # sotto soglia anche un "si'" pronunciato chiaramente.
-        if _loudest_rms(chunk.samples) < config.SILENCE_RMS_THRESHOLD:
+        # Il trattamento del segnale viene PRIMA del controllo di
+        # silenzio. Nell'ordine inverso, il guadagno pensato per i
+        # microfoni deboli non entrava mai in gioco: quelle frasi
+        # venivano scartate dal controllo un istante prima, pur essendo
+        # parlato perfettamente comprensibile una volta alzate.
+        audio = _normalise_gain(_tame_peaks(np.asarray(chunk.samples, dtype=np.float32)))
+
+        if _loudest_rms(audio) < config.SILENCE_RMS_THRESHOLD:
             return
 
-        audio = _normalise_gain(_tame_peaks(np.asarray(chunk.samples, dtype=np.float32)))
         duration = audio.size / config.AUDIO_SAMPLE_RATE
+        # Tempo di parlato vero, senza il silenzio reinserito dagli
+        # accorpamenti: e' questo che deve decidere se la frase e'
+        # abbastanza lunga da poter votare sulla lingua, e su questo si
+        # misura la velocita' dichiarata all'utente.
+        parlato = max(0.0, duration - chunk.padding_seconds)
 
         # Ogni tanto lasciamo che il modello ridica la sua sulla lingua:
         # se il colloquio prosegue davvero in un'altra lingua dobbiamo
         # accorgercene, invece di insistere per un'ora su quella
         # riconosciuta male nelle prime due battute.
-        sonda = self._should_probe_language(duration)
+        sonda = self._should_probe_language(parlato)
         lingua_chiamata = None if sonda else self._locked_language
 
         started = time.monotonic()
@@ -591,22 +670,29 @@ class TranscriptionEngine:
             # a ogni frase ed e' una fonte nota di righe inventate sul
             # rumore, dove il modello entra in un ciclo di soli tempi.
             without_timestamps=True,
-            initial_prompt=self._prompt_for_call(lingua_chiamata),
+            # Il suggerimento dipende dalla lingua del COLLOQUIO, non da
+            # quella passata alla chiamata. Durante una sonda passiamo
+            # None per lasciar decidere il modello, ma il riconoscimento
+            # della lingua usa solo l'encoder: togliere anche il
+            # suggerimento peggiorava la trascrizione senza influenzare
+            # in alcun modo la scelta della lingua.
+            initial_prompt=self._prompt_for_call(self._locked_language),
         )
         parts = [seg.text.strip() for seg in segments]
 
         elapsed = time.monotonic() - started
-        self._record_speed(duration, elapsed)
+        self._record_speed(parlato, elapsed)
 
         text = " ".join(part for part in parts if part).strip()
         if not text:
+            self._forget_last(chunk.speaker)
             return
 
         detected = getattr(info, "language", "") or ""
         self._consider_language(
             detected,
             float(getattr(info, "language_probability", 0.0) or 0.0),
-            duration,
+            parlato,
             len(text.split()),
             probe=sonda,
         )
@@ -624,6 +710,7 @@ class TranscriptionEngine:
             )
             text = _strip_overlap(previous, text)
             if not text:
+                self._last_text.pop(chunk.speaker, None)
                 return
 
             # Ultima rete di sicurezza contro l'eco: la stessa frase
@@ -633,6 +720,10 @@ class TranscriptionEngine:
                 if self._is_echo_of_candidate(text, chunk.offset):
                     self.duplicates_dropped += 1
                     self.echo.detections += 1
+                    # La catena si interrompe qui: il testo appena
+                    # scartato non deve restare come termine di
+                    # confronto per la frase successiva.
+                    self._last_text.pop(chunk.speaker, None)
                     log.debug("Frase scartata perche' duplicata dall'altro canale")
                     return
 
@@ -663,6 +754,19 @@ class TranscriptionEngine:
             self.on_segment(segment)
 
     # ------------------------------------------------------------------
+    def _forget_last(self, speaker: str) -> None:
+        """
+        Dimentica l'ultima frase di un interlocutore.
+
+        Da chiamare ogni volta che un blocco viene scartato: la
+        rimozione delle parole ripetute confronta la frase nuova con la
+        precedente, e se quella precedente non e' mai stata pubblicata
+        il confronto avviene con un testo vecchio di secondi. Il
+        risultato era la sparizione dell'inizio della frase successiva.
+        """
+        with self._lock:
+            self._last_text.pop(speaker, None)
+
     def _prompt_for_call(self, language: Optional[str]) -> Optional[str]:
         """
         Il suggerimento di contesto va dato solo nella sua lingua.
@@ -740,17 +844,28 @@ class TranscriptionEngine:
         # che gli abbiamo imposto noi.
         if not probe:
             return
-        if detected == self._locked_language:
-            self._unlock_votes.clear()
-            return
-        if probability < config.LANGUAGE_UNLOCK_PROBABILITY:
+        # I voti di sblocco devono essere CONSECUTIVI. Accumulandoli
+        # senza mai farli decadere, tre sonde sbagliate anche distanti
+        # mezz'ora l'una dall'altra ribaltavano la lingua di un
+        # colloquio che nel frattempo era stato confermato decine di
+        # volte: da quel momento tutto il resto usciva illeggibile.
+        if detected == self._locked_language or probability < (
+            config.LANGUAGE_UNLOCK_PROBABILITY
+        ):
+            self._unlock_candidate = None
+            self._unlock_streak = 0
             return
 
-        self._unlock_votes[detected] += 1
-        if self._unlock_votes[detected] >= config.LANGUAGE_UNLOCK_VOTES:
+        if detected != self._unlock_candidate:
+            self._unlock_candidate = detected
+            self._unlock_streak = 0
+        self._unlock_streak += 1
+
+        if self._unlock_streak >= config.LANGUAGE_UNLOCK_VOTES:
             precedente = self._locked_language
             self._locked_language = detected
-            self._unlock_votes.clear()
+            self._unlock_candidate = None
+            self._unlock_streak = 0
             self._language_votes.clear()
             self._language_votes[detected] = config.LANGUAGE_LOCK_VOTES
             log.info("Lingua del colloquio corretta da '%s' a '%s'", precedente, detected)
