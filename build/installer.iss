@@ -12,8 +12,14 @@
 ;   altro programma Windows, senza bisogno di Python.
 ; ============================================================
 
+; Richiede Inno Setup 6.3 o successivo (per ArchitecturesAllowed=x64compatible).
 #define MyAppName "Interview Assistant"
-#define MyAppVersion "0.2.2"
+; La versione puo' arrivare dalla riga di comando (/DMyAppVersion=3.1.0),
+; cosi' la build automatica la prende da app/config.py e non esiste modo
+; di pubblicare un installer che dichiara un numero diverso dal programma.
+#ifndef MyAppVersion
+  #define MyAppVersion "3.0.0"
+#endif
 #define MyAppPublisher "Interview Assistant"
 #define MyAppExeName "InterviewAssistant.exe"
 
@@ -35,6 +41,16 @@ Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=lowest
+; Senza questa riga, un avvio con "Esegui come amministratore" cambiava
+; la cartella di destinazione da %LOCALAPPDATA% a Program Files: il
+; doppio clic successivo non trovava piu' l'installazione precedente e
+; ne creava una SECONDA, con due voci nel menu Start e un solo
+; programma avviabile per volta.
+PrivilegesRequiredOverridesAllowed=dialog
+; Nome del semaforo usato dal programma per impedire due copie aperte
+; (vedi app/single_instance.py): permette all'installer di accorgersi
+; che l'applicazione e' in esecuzione prima di toccarne i file.
+AppMutex=Local\InterviewAssistant-FinestraPrincipale
 
 ; "x64compatible" comprende sia i PC con processore Intel/AMD a 64 bit
 ; sia quelli con processore ARM64 che eseguono programmi x64 in
@@ -49,6 +65,7 @@ CloseApplications=yes
 RestartApplications=no
 UninstallDisplayName={#MyAppName}
 UninstallDisplayIcon={app}\{#MyAppExeName}
+SetupIconFile=..\app\resources\icon.ico
 
 [Languages]
 Name: "italian"; MessagesFile: "compiler:Languages\Italian.isl"
@@ -56,6 +73,18 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "Crea un'icona sul desktop"; GroupDescription: "Icone aggiuntive:"
+
+[InstallDelete]
+; Il programma e' distribuito come cartella di moduli, non come file
+; unico: sovrascrivere non basta. Installando sopra una versione
+; precedente restavano file che non esistono piu' in questa (moduli di
+; librerie riorganizzate, DLL di versioni diverse), e Python li
+; caricava insieme ai nuovi. Il risultato erano guasti che non si
+; riproducono su nessuna macchina pulita, quindi impossibili da
+; diagnosticare a distanza. Qui la cartella dei moduli viene svuotata
+; prima di copiare: i dati dell'utente stanno altrove e non vengono
+; toccati.
+Type: filesandordirs; Name: "{app}\_internal"
 
 [Files]
 Source: "..\dist\InterviewAssistant\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -75,10 +104,21 @@ procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usPostUninstall then
   begin
+    // In disinstallazione silenziosa non c'e' nessuno a rispondere: la
+    // finestra resterebbe invisibile e il comando non finirebbe mai.
+    if UninstallSilent then
+      exit;
     if MsgBox('Vuoi eliminare anche i modelli AI scaricati e i colloqui salvati?' + #13#10 +
               'Occupano alcuni gigabyte in %APPDATA%\InterviewAssistant.' + #13#10 + #13#10 +
               'Scegli No se intendi reinstallare il programma piu'' avanti.',
               mbConfirmation, MB_YESNO) = IDYES then
+    begin
+      // Il programma sceglie da solo dove scrivere: %APPDATA% se
+      // possibile, altrimenti %LOCALAPPDATA% (vedi app/config.py).
+      // Guardare in un posto solo lasciava indietro alcuni gigabyte
+      // proprio sui computer aziendali, dove il ripiego e' la norma.
       DelTree(ExpandConstant('{userappdata}\InterviewAssistant'), True, True, True);
+      DelTree(ExpandConstant('{localappdata}\InterviewAssistant'), True, True, True);
+    end;
   end;
 end;

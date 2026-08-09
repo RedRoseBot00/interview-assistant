@@ -12,11 +12,21 @@
 # riceve un unico file di installazione creato con Inno Setup, che la
 # installa come qualunque altro programma Windows.
 
+import sys
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 project_root = Path(SPECPATH).resolve().parent
+
+# Numero di versione letto da app/config.py: una sola fonte, cosi' la
+# risorsa di versione dell'eseguibile non puo' discordare dal programma.
+_versione = "0.0.0"
+for _riga in (project_root / "app" / "config.py").read_text(encoding="utf-8").splitlines():
+    if _riga.startswith("APP_VERSION"):
+        _versione = _riga.split('"')[1]
+        break
+_v = tuple(int(p) for p in (_versione.split(".") + ["0", "0", "0"])[:4])
 
 binaries = []
 datas = []
@@ -34,12 +44,21 @@ PACCHETTI_OBBLIGATORI = (
     "llama_cpp",
     "av",
 )
+# Su Windows la cattura dell'audio di sistema e' la funzione centrale
+# del programma: senza PyAudioWPatch la voce del candidato non viene
+# trascritta affatto. Non e' quindi un pacchetto facoltativo, e la sua
+# assenza deve fermare la compilazione invece di stampare un avviso che
+# nessuno legge.
+if sys.platform == "win32":
+    PACCHETTI_OBBLIGATORI += ("pyaudiowpatch",)
+
 PACCHETTI_FACOLTATIVI = (
-    "pyaudiowpatch",
     "docx",
     "huggingface_hub",
     "tqdm",
 )
+if sys.platform != "win32":
+    PACCHETTI_FACOLTATIVI += ("pyaudiowpatch",)
 
 for package in PACCHETTI_OBBLIGATORI + PACCHETTI_FACOLTATIVI:
     try:
@@ -60,19 +79,16 @@ for package in PACCHETTI_OBBLIGATORI + PACCHETTI_FACOLTATIVI:
     binaries += pkg_binaries
     hiddenimports += pkg_hidden
 
+# Tutti i moduli del programma, elencati automaticamente. Prima erano
+# scritti a mano ed erano dodici su ventidue: la lista funzionava per
+# caso, perche' i mancanti risultavano comunque raggiungibili leggendo
+# il codice. Bastava pero' aggiungere un modulo caricato in modo
+# dinamico perche' sparisse dal pacchetto senza alcun errore di
+# compilazione, e il guasto si sarebbe visto solo sul computer del
+# cliente.
+hiddenimports += collect_submodules("app")
+
 hiddenimports += [
-    "app",
-    "app.main",
-    "app.compat",
-    "app.diagnostics",
-    "app.settings",
-    "app.single_instance",
-    "app.audio.capture",
-    "app.transcription.engine",
-    "app.summarization.llm",
-    "app.models.download",
-    "app.storage.db",
-    "app.export.report",
     # Estensione C di PyAudioWPatch: si trova accanto al pacchetto e non
     # al suo interno, quindi la raccolta automatica non la vede.
     "_portaudiowpatch",
@@ -112,6 +128,39 @@ for _attesa in ("llama_cpp/lib/llama", "ctranslate2"):
         )
 
 icon_path = project_root / "app" / "resources" / "icon.ico"
+if icon_path.exists():
+    # L'icona serve anche a runtime (barra delle applicazioni, finestre
+    # di dialogo): dentro il pacchetto, non solo come risorsa dell'exe.
+    datas += [(str(icon_path), "app/resources")]
+
+# Risorsa di versione dell'eseguibile. Senza, la scheda "Dettagli" delle
+# proprieta' del file e' vuota: chi assiste il cliente non ha modo di
+# sapere quale versione ha in mano partendo dal file, e un binario privo
+# di metadati viene giudicato piu' severamente dai filtri antivirus.
+_version_file = project_root / "build" / "version_info.txt"
+_version_file.write_text(
+    f"""VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers={_v}, prodvers={_v},
+    mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([StringTable('040904B0', [
+      StringStruct('CompanyName', 'Interview Assistant'),
+      StringStruct('FileDescription', 'Assistente AI per colloqui di lavoro'),
+      StringStruct('FileVersion', '{_versione}'),
+      StringStruct('InternalName', 'InterviewAssistant'),
+      StringStruct('OriginalFilename', 'InterviewAssistant.exe'),
+      StringStruct('ProductName', 'Interview Assistant'),
+      StringStruct('ProductVersion', '{_versione}'),
+    ])]),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)
+""",
+    encoding="utf-8",
+)
 
 a = Analysis(
     [str(project_root / "run.py")],
@@ -154,6 +203,7 @@ exe = EXE(
     upx=False,
     console=False,  # nessuna finestra nera: solo interfaccia grafica
     icon=str(icon_path) if icon_path.exists() else None,
+    version=str(_version_file),
 )
 
 coll = COLLECT(
