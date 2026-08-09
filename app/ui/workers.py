@@ -74,7 +74,9 @@ class StartupWorker(QThread):
                 return
 
             self.stage.emit("Verifica della compatibilita' con il processore...")
-            result = diagnostics.run_transcription_selftest(self.whisper_size)
+            result = diagnostics.run_transcription_selftest(
+                self.whisper_size, should_stop=self._stopped
+            )
             if self._stopped():
                 return
 

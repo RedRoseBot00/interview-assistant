@@ -53,6 +53,7 @@ class InterviewSession(QObject):
         self._starting = False
         self._stopping = False
         self._stop_requested = False
+        self._start_thread: threading.Thread | None = None
         self.clean_shutdown = True
         self._warnings_shown = 0
 
@@ -103,9 +104,15 @@ class InterviewSession(QObject):
             if self._starting or self._stop_requested:
                 return
             self._starting = True
-        threading.Thread(
-            target=self._start_blocking, name="session-start", daemon=True
-        ).start()
+            # Il riferimento al thread va conservato: l'arresto deve
+            # poterlo attendere. Senza, chi chiudeva la finestra durante
+            # l'apertura dei dispositivi faceva partire i due percorsi in
+            # parallelo, e il colloquio veniva salvato vuoto mentre il
+            # motore di trascrizione si avviava a sessione gia' conclusa.
+            self._start_thread = threading.Thread(
+                target=self._start_blocking, name="session-start", daemon=True
+            )
+        self._start_thread.start()
 
     def _aborted(self) -> bool:
         with self._lifecycle:
@@ -154,8 +161,15 @@ class InterviewSession(QObject):
                 self._starting = False
 
     def _cleanup_after_failed_start(self) -> None:
-        """Chiude tutto cio' che era gia' stato aperto prima dell'errore."""
-        for closer in (lambda: self.engine.stop(timeout=5), self.recorder.stop):
+        """
+        Chiude tutto cio' che era gia' stato aperto prima dell'errore.
+
+        L'ordine e' lo stesso dell'arresto normale — prima le sorgenti
+        audio, poi il motore — per la stessa ragione: le ultime frasi
+        nascono proprio quando gli stream si chiudono, e con il motore
+        gia' fermo finirebbero in una coda che nessuno legge.
+        """
+        for closer in (self.recorder.stop, lambda: self.engine.stop(timeout=5)):
             try:
                 closer()
             except Exception:
@@ -182,6 +196,18 @@ class InterviewSession(QObject):
 
     def _stop_blocking(self) -> None:
         clean = True
+
+        # Prima di toccare qualunque cosa, lasciamo finire l'avvio se e'
+        # ancora in corso. _stop_requested e' gia' impostato, quindi
+        # quell'avvio si fermera' da solo al primo controllo; qui
+        # aspettiamo soltanto che abbia smesso di usare i dispositivi.
+        avvio = self._start_thread
+        if avvio is not None and avvio.is_alive():
+            log.info("Attendo la conclusione dell'avvio prima di fermare")
+            avvio.join(timeout=20)
+            if avvio.is_alive():
+                clean = False
+                log.error("L'avvio della sessione non si e' concluso")
 
         # L'ordine conta: prima si fermano le sorgenti audio, poi il
         # motore. Chiudendo il motore per primo, l'ultima frase del

@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSplitter,
     QTabWidget,
@@ -59,7 +60,10 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(f"{config.APP_DISPLAY_NAME} — assistente per colloqui")
         self.resize(1440, 880)
-        self.setMinimumSize(1150, 720)
+        # La colonna del candidato sta dentro un'area scorrevole, quindi
+        # il minimo puo' restare basso: su un portatile 1366x768 la
+        # finestra ci sta comunque, e nulla viene compresso.
+        self.setMinimumSize(1100, 680)
 
         self.session: InterviewSession | None = None
         self.startup_worker: StartupWorker | None = None
@@ -107,6 +111,12 @@ class MainWindow(QMainWindow):
         self.platform_timer = QTimer(self)
         self.platform_timer.timeout.connect(self._refresh_platform)
         self.platform_timer.start(8000)
+
+        # Salvataggio ritardato dei dati del candidato: scatta poco dopo
+        # l'ultima modifica, non a ogni tasto premuto.
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setSingleShot(True)
+        self._autosave_timer.timeout.connect(self._autosave_candidate)
 
         self._refresh_platform()
         self._refresh_history()
@@ -325,6 +335,17 @@ class MainWindow(QMainWindow):
         return card
 
     def _build_candidate_column(self) -> QWidget:
+        """
+        Colonna destra, dentro un'area scorrevole.
+
+        Senza lo scorrimento, su un portatile 1366x768 — dove la finestra
+        non puo' essere alta piu' di circa settecento pixel — il layout
+        comprimeva le didascalie "Nome", "Posizione", "Esperienza" e
+        "Competenze" a dodici pixel contro i sedici necessari, e le
+        lettere risultavano tagliate sopra e sotto. Con l'area
+        scorrevole ogni elemento conserva la propria altezza e, se lo
+        spazio non basta, si scorre.
+        """
         column = QWidget()
         layout = QVBoxLayout(column)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -341,6 +362,19 @@ class MainWindow(QMainWindow):
         self.skills_input.setPlaceholderText("Competenze separate da virgola")
         self.skills_input.textChanged.connect(self._refresh_skill_chips)
 
+        # Tutto cio' che l'utente scrive sulla scheda del candidato viene
+        # risalvato da solo poco dopo. Prima l'unico salvataggio avveniva
+        # nell'istante in cui il colloquio finiva: chi seguiva il flusso
+        # naturale — finisco, leggo il report, scrivo la valutazione,
+        # chiudo — perdeva tutto quello che aveva scritto dopo lo stop.
+        for campo in (
+            self.candidate_input,
+            self.role_input,
+            self.experience_input,
+            self.skills_input,
+        ):
+            campo.textChanged.connect(self._schedule_autosave)
+
         for label, widget in (
             ("Nome", self.candidate_input),
             ("Posizione", self.role_input),
@@ -349,6 +383,9 @@ class MainWindow(QMainWindow):
         ):
             caption = QLabel(label)
             caption.setProperty("class", "Muted")
+            # Altezza minima pari a quella del testo: senza, il layout
+            # comprime per prime proprio le didascalie.
+            caption.setMinimumHeight(caption.fontMetrics().height() + 2)
             candidate_card.add(caption)
             candidate_card.add(widget)
 
@@ -369,9 +406,47 @@ class MainWindow(QMainWindow):
             "Appunti durante il colloquio.\n"
             "Vengono salvati insieme alla trascrizione e finiscono nel report."
         )
+        self.notes_edit.textChanged.connect(self._schedule_autosave)
+        self.notes_edit.setMinimumHeight(120)
         notes_card.add(self.notes_edit, 1)
         layout.addWidget(notes_card, 1)
-        return column
+
+        scorrevole = QScrollArea()
+        scorrevole.setWidget(column)
+        scorrevole.setWidgetResizable(True)
+        scorrevole.setFrameShape(QFrame.NoFrame)
+        scorrevole.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scorrevole.setMinimumWidth(300)
+        return scorrevole
+
+    # ------------------------------------------------------------------
+    def _schedule_autosave(self) -> None:
+        """Rimanda il salvataggio di un paio di secondi, per non scrivere a ogni tasto."""
+        if self.current_interview_id is None:
+            return
+        self._autosave_timer.start(1500)
+
+    def _autosave_candidate(self) -> None:
+        """Riporta nell'archivio quello che si vede a schermo."""
+        if self.current_interview_id is None:
+            return
+        try:
+            db.update_details(
+                self.current_interview_id,
+                candidate_name=self.candidate_input.text().strip() or "Senza nome",
+                role=self.role_input.text().strip(),
+                notes=self.notes_edit.toPlainText().strip(),
+                experience=self.experience_input.text().strip(),
+                skills=self.skills_input.text().strip(),
+            )
+        except Exception:
+            log.exception("Salvataggio automatico dei dati del candidato fallito")
+            self._add_warning(
+                "Le note e i dati del candidato non sono stati salvati "
+                "nell'archivio: controlla i log."
+            )
+            return
+        self._refresh_history()
 
     # ==================================================================
     # Scheda "Report"
@@ -875,6 +950,13 @@ class MainWindow(QMainWindow):
     def _on_session_stopped(self) -> None:
         session = self.session
         if session is None:
+            # Puo' capitare quando l'avvio era gia' fallito: la sessione
+            # e' stata liberata da un altro percorso. Se pero' stiamo
+            # chiudendo, la chiusura era stata rimandata proprio a questo
+            # momento e senza questa riga la finestra non si chiudeva
+            # piu': la X sembrava semplicemente non funzionare.
+            if self.closing:
+                self.close()
             return
 
         self.progress_bar.setVisible(False)
@@ -901,6 +983,17 @@ class MainWindow(QMainWindow):
             return
 
         self._save_current_interview()
+
+        if not self._pending.get("segments"):
+            # Nessuna frase riconosciuta: senza questo ramo il messaggio
+            # restava per sempre su "attendo le ultime frasi...", mentre
+            # il colloquio era gia' stato salvato.
+            self.report_button.setEnabled(True)
+            self.status_label.setText(
+                "Colloquio salvato, ma non e' stata riconosciuta alcuna frase: "
+                "controlla il microfono e l'audio di sistema nelle impostazioni."
+            )
+            return
 
         if settings.get("auto_generate_report", True):
             self.tabs.setCurrentIndex(TAB_REPORT)
@@ -1016,14 +1109,25 @@ class MainWindow(QMainWindow):
         self.report_button.setEnabled(True)
         self.delete_report_button.setEnabled(bool(result.text.strip()))
 
+        salvato = True
         if self.current_interview_id is not None:
             try:
                 db.update_report(self.current_interview_id, result.text, result.used_llm)
                 self._refresh_history()
             except Exception:
+                salvato = False
                 log.exception("Aggiornamento del report non riuscito")
+                # Senza questo avviso il messaggio diceva "colloquio
+                # salvato" mentre il report esisteva solo a schermo, e
+                # spariva alla chiusura del programma.
+                self._add_warning(
+                    "Il report e' stato generato ma NON salvato nell'archivio: "
+                    "esportalo subito in Word per non perderlo."
+                )
 
-        if result.used_llm:
+        if not salvato:
+            self.status_label.setText("Report generato ma non salvato: esportalo.")
+        elif result.used_llm:
             self.status_label.setText("Report generato e colloquio salvato.")
         else:
             self.status_label.setText("Report di riserva generato.")
@@ -1072,9 +1176,19 @@ class MainWindow(QMainWindow):
         self.status_label.setText("Report eliminato. Puoi generarne uno nuovo.")
 
     def _on_report_failed(self, message: str) -> None:
+        # Come per gli altri due esiti: un worker di un colloquio
+        # precedente non deve riabilitare i pulsanti di quello attuale.
+        if self.sender() is not self.report_worker:
+            log.info("Fallimento di un report precedente ignorato")
+            return
         self.progress_bar.setVisible(False)
         self.progress_bar.setRange(0, 100)
         self.report_button.setEnabled(True)
+        # Il testo comparso durante la scrittura e' un troncone che
+        # nell'archivio non esiste: lasciarlo a schermo, per giunta senza
+        # poterlo cancellare, faceva credere di avere un report valido.
+        self.report_view.clear()
+        self.delete_report_button.setEnabled(False)
         self.status_label.setText("Errore nella generazione del report.")
         QMessageBox.warning(self, "Report non generato", message)
 
@@ -1158,6 +1272,17 @@ class MainWindow(QMainWindow):
                 )
 
     def _refresh_platform(self) -> None:
+        # Occasione buona anche per accorgersi che la finestra della
+        # videochiamata e' stata chiusa: DWM non lo segnala, e senza
+        # questo controllo l'anteprima restava un rettangolo nero fino
+        # al riavvio del programma.
+        try:
+            if self.call_view.source is not None and not self.call_view.source_alive():
+                self.call_view.refresh()
+                self._refresh_window_list()
+        except Exception:
+            log.debug("Controllo dell'anteprima non riuscito", exc_info=True)
+
         if self.platform_probe is not None and self.platform_probe.isRunning():
             return
         self.platform_probe = PlatformProbe()
@@ -1177,12 +1302,17 @@ class MainWindow(QMainWindow):
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
-        for raw in text.split(",")[:8]:
-            skill = raw.strip()
-            if skill:
-                self.skills_row.insertWidget(
-                    self.skills_row.count() - 1, Chip(skill, "SkillChip")
-                )
+        # La colonna del candidato e' la piu' stretta: allineati su una
+        # riga sola, i riquadri delle competenze venivano tagliati a
+        # meta' parola, senza puntini e senza suggerimento. Ne mostriamo
+        # meno, accorciamo quelli lunghi e il testo intero resta
+        # leggibile passandoci sopra il puntatore.
+        competenze = [s.strip() for s in text.split(",") if s.strip()][:4]
+        for skill in competenze:
+            etichetta = skill if len(skill) <= 14 else skill[:13] + "…"
+            chip = Chip(etichetta, "SkillChip")
+            chip.setToolTip(skill)
+            self.skills_row.insertWidget(self.skills_row.count() - 1, chip)
 
     def _toggle_captions(self, enabled: bool) -> None:
         self.captions_button.setText(
@@ -1331,6 +1461,12 @@ class MainWindow(QMainWindow):
             )
             return
         if interview is None:
+            # L'elenco mostrava un colloquio e il dettaglio ne mostrava
+            # un altro, quello selezionato prima: due schermate in
+            # disaccordo, senza alcuna indicazione.
+            self.history_detail.setPlainText(
+                "Questo colloquio non e' piu' presente nell'archivio."
+            )
             return
 
         labels = self._labels()
@@ -1339,6 +1475,12 @@ class MainWindow(QMainWindow):
             f"Posizione: {interview.role or 'non indicata'}",
             f"Data: {interview.display_date}",
             f"Durata: {int(interview.duration_seconds // 60)} min",
+        ]
+        if interview.experience:
+            lines.append(f"Esperienza: {interview.experience}")
+        if interview.skills:
+            lines.append(f"Competenze: {interview.skills}")
+        lines += [
             "",
             "=== REPORT ===",
             interview.report or "(report non generato)",
@@ -1378,9 +1520,33 @@ class MainWindow(QMainWindow):
         )
         if answer != QMessageBox.Yes:
             return
-        db.delete_interview(interview.id)
+        try:
+            db.delete_interview(interview.id)
+        except Exception:
+            log.exception("Eliminazione del colloquio non riuscita")
+            QMessageBox.warning(
+                self,
+                "Eliminazione non riuscita",
+                "Il colloquio non e' stato eliminato dall'archivio. "
+                "Il dettaglio dell'errore e' nel file di log.",
+            )
+            return
+
         if self.current_interview_id == interview.id:
+            # Il colloquio a schermo non esiste piu': i pulsanti che
+            # agiscono su di esso restavano accesi e, premuti, non
+            # facevano nulla senza dire perche'.
             self.current_interview_id = None
+            self._autosave_timer.stop()
+            self.export_docx_button.setEnabled(False)
+            self.export_txt_button.setEnabled(False)
+            self.report_button.setEnabled(False)
+            self.delete_report_button.setEnabled(False)
+            self.report_view.clear()
+            self._pending = {}
+            self.status_label.setText(
+                "Il colloquio corrente e' stato eliminato dall'archivio."
+            )
         self._refresh_history()
         self.history_detail.clear()
 
@@ -1388,11 +1554,23 @@ class MainWindow(QMainWindow):
     # Impostazioni
     # ==================================================================
     def _save_settings(self) -> None:
+        if self.is_recording:
+            QMessageBox.information(
+                self,
+                "Colloquio in corso",
+                "Le impostazioni del motore non si possono cambiare mentre "
+                "un colloquio e' in registrazione. Termina il colloquio e "
+                "riprova.",
+            )
+            return
+
         previous_model = settings.get("whisper_model_size", "small")
         previous_cpu = settings.get("cpu_mode", "auto")
         new_model = self.model_combo.currentData()
         new_cpu = self.cpu_combo.currentData()
 
+        # explicit=True: sono scelte fatte a mano dall'utente e nessuna
+        # taratura automatica potra' piu' sovrascriverle.
         settings.set_many(
             {
                 "whisper_model_size": new_model,
@@ -1401,7 +1579,8 @@ class MainWindow(QMainWindow):
                 "capture_microphone": self.mic_check.isChecked(),
                 "capture_system_audio": self.system_check.isChecked(),
                 "cpu_mode": new_cpu,
-            }
+            },
+            explicit=True,
         )
 
         if new_model != previous_model or new_cpu != previous_cpu:
@@ -1418,6 +1597,18 @@ class MainWindow(QMainWindow):
             )
 
     def _retest_engine(self) -> None:
+        # Il test riavvia la preparazione, che disabilita il pulsante di
+        # registrazione: premuto durante un colloquio, e con il test poi
+        # fallito, il selezionatore restava senza alcun modo di fermare
+        # e salvare quello che stava registrando.
+        if self.is_recording:
+            QMessageBox.information(
+                self,
+                "Colloquio in corso",
+                "Il test di compatibilita' non puo' essere eseguito mentre "
+                "un colloquio e' in registrazione.",
+            )
+            return
         settings.set_many({"engine_selftest": "", "engine_selftest_size": ""})
         self._start_preparation()
 
@@ -1464,6 +1655,14 @@ class MainWindow(QMainWindow):
                     event.ignore()
                     return
 
+        # Ultimo salvataggio: se l'utente ha scritto qualcosa negli
+        # ultimi due secondi, il timer non e' ancora scattato.
+        self._autosave_timer.stop()
+        try:
+            self._autosave_candidate()
+        except Exception:
+            log.exception("Salvataggio finale dei dati del candidato fallito")
+
         self.elapsed_timer.stop()
         self.platform_timer.stop()
         self.call_view.clear()
@@ -1475,18 +1674,19 @@ class MainWindow(QMainWindow):
                 worker.cancel()
             else:
                 worker.requestInterruption()
-            if not worker.wait(5000):
+            if not worker.wait(8000):
+                # Non lo uccidiamo. Uccidere un QThread mentre esegue
+                # codice Python lo interrompe in un punto qualunque: se
+                # in quell'istante teneva il blocco globale
+                # dell'interprete, nessun altro thread puo' piu' andare
+                # avanti e la finestra resta a schermo per sempre. Il
+                # thread e' comunque contrassegnato come interrotto e
+                # non tocchera' piu' l'interfaccia; il programma esce
+                # ugualmente perche' tutti i lavori sono in background.
                 log.warning(
-                    "Attesa prolungata di %s alla chiusura", type(worker).__name__
+                    "%s non si e' fermato entro il tempo previsto: "
+                    "chiudo comunque",
+                    type(worker).__name__,
                 )
-                # Mai un'attesa senza limite di tempo: bloccherebbe il
-                # thread grafico e Windows dichiarerebbe la finestra
-                # "non risponde", senza alcuna via d'uscita per l'utente.
-                if not worker.wait(3000):
-                    log.error(
-                        "%s non si e' fermato: lo termino", type(worker).__name__
-                    )
-                    worker.terminate()
-                    worker.wait(2000)
 
         event.accept()

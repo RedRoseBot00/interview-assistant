@@ -293,9 +293,32 @@ class CallView(QWidget):
         rect.bottom = int((offset_y + draw_h) * ratio)
         return rect
 
+    def source_alive(self) -> bool:
+        """
+        La finestra della videochiamata esiste ancora?
+
+        Serve perche' DWM non avvisa quando la sorgente sparisce: la
+        miniatura resta registrata, il riquadro diventa un rettangolo
+        nero permanente e il messaggio "Nessuna videochiamata
+        selezionata" non ricompare piu'. L'utente vede un buco senza
+        alcuna spiegazione.
+        """
+        if self._thumbnail is None or self._source is None or not IS_WINDOWS:
+            return False
+        try:
+            return bool(ctypes.windll.user32.IsWindow(wintypes.HWND(self._source.handle)))
+        except Exception:
+            return True     # nel dubbio non buttiamo via l'anteprima
+
     def refresh(self) -> None:
         """Riallinea la miniatura dopo spostamenti, ridimensionamenti o cambi di scheda."""
         if self._thumbnail is None:
+            return
+        if not self.source_alive():
+            log.info("La finestra della videochiamata e' stata chiusa")
+            self.clear()
+            self._source = None
+            self.update()
             return
         try:
             self._read_source_size()

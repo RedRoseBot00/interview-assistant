@@ -131,6 +131,10 @@ QPushButton#StopButton {{
     color: #ffffff;
 }}
 QPushButton#StopButton:hover {{ background: #b91c1c; }}
+/* Senza questa riga il pulsante restava rosso pieno anche da
+   disattivato: durante lo smaltimento della coda — che dura decine di
+   secondi — sembrava premibile, e l'utente lo cliccava a vuoto. */
+QPushButton#StopButton:disabled {{ background: #eda3a3; color: #fff5f5; }}
 
 QPushButton#AccentButton {{
     background: {ACCENT};
