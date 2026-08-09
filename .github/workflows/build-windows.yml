@@ -60,10 +60,20 @@ jobs:
           if (-not $iscc) { throw "ISCC.exe non trovato" }
           & $iscc.FullName build\installer.iss
 
+      - name: Leggi il numero di versione
+        # Il numero finisce nel nome del file scaricabile: cosi' non c'e'
+        # modo di confondere una build con quella precedente.
+        id: versione
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path app/config.py -Pattern 'APP_VERSION\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          "numero=$v" >> $env:GITHUB_OUTPUT
+          Write-Host "Versione rilevata: $v"
+
       - name: Carica l'installer come risultato della build
         uses: actions/upload-artifact@v4
         with:
-          name: InterviewAssistantSetup
+          name: InterviewAssistant-v${{ steps.versione.outputs.numero }}-Setup
           path: build/Output/InterviewAssistantSetup.exe
           if-no-files-found: error
 
