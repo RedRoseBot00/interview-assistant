@@ -88,6 +88,11 @@ hiddenimports += [
     "psutil",
     "requests",
     "certifi",
+    # Senza questo, requests avvisa a ogni avvio di non saper
+    # riconoscere la codifica dei testi scaricati.
+    "charset_normalizer",
+    "idna",
+    "urllib3",
 ]
 
 # Verifica finale: se queste librerie native non sono state raccolte, il

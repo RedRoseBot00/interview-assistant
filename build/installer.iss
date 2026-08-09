@@ -13,7 +13,7 @@
 ; ============================================================
 
 #define MyAppName "Interview Assistant"
-#define MyAppVersion "0.2.0"
+#define MyAppVersion "0.2.1"
 #define MyAppPublisher "Interview Assistant"
 #define MyAppExeName "InterviewAssistant.exe"
 
