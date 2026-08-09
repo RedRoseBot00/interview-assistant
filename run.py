@@ -93,7 +93,14 @@ def _fatal(message: str) -> None:
     except Exception:
         pass
 
-    if sys.platform == "win32":
+    # Nei ruoli di servizio non c'e' nessun utente davanti allo schermo:
+    # una finestra modale bloccherebbe per sempre il processo che ci ha
+    # avviati (o la macchina di compilazione), invece di far emergere
+    # l'errore. Il messaggio resta comunque scritto nel file qui sopra.
+    servizio = any(
+        arg in sys.argv for arg in ("--smoke-test", "--self-test", "--generate-report")
+    )
+    if sys.platform == "win32" and not servizio:
         try:
             import ctypes
 
@@ -142,6 +149,12 @@ def _run_smoke_test() -> int:
     una libreria manca dal pacchetto, il problema emerge qui e non sul
     computer del cliente.
     """
+    # Anche qui vanno zittiti i dialoghi di errore di Windows: senza,
+    # una libreria che incontra un'istruzione non supportata apre una
+    # finestra modale che sulla macchina di compilazione nessuno puo'
+    # chiudere, e il lavoro resta appeso fino al limite di sei ore.
+    _silence_windows_error_dialogs()
+
     import importlib
     import logging
 
@@ -174,11 +187,29 @@ def _run_smoke_test() -> int:
             errori.append(f"{nome}: {type(exc).__name__}: {exc}")
             log.error("modulo '%s' NON disponibile: %s", nome, exc)
 
+    # Importare PySide6.QtWidgets riesce anche senza il connettore
+    # grafico di Windows: e' invece proprio la sua assenza il modo piu'
+    # classico in cui un pacchetto PyInstaller+Qt arriva al cliente e
+    # non apre alcuna finestra. Creare l'oggetto applicazione e' il
+    # solo controllo che se ne accorge.
+    try:
+        from PySide6.QtWidgets import QApplication
+
+        os.environ.setdefault("QT_QPA_PLATFORM", "windows")
+        prova = QApplication([])
+        del prova
+        log.info("connettore grafico Qt: presente")
+    except Exception as exc:
+        errori.append(f"connettore grafico Qt: {type(exc).__name__}: {exc}")
+        log.error("connettore grafico Qt NON disponibile: %s", exc)
+
     if errori:
-        log.error("Verifica del pacchetto fallita: %d moduli mancanti", len(errori))
+        log.error("Verifica del pacchetto fallita: %d controlli non superati", len(errori))
+        for riga in errori:
+            log.error("  - %s", riga)
         return 1
 
-    log.info("Verifica del pacchetto superata: %d moduli", len(moduli))
+    log.info("Verifica del pacchetto superata: %d moduli + interfaccia", len(moduli))
     return 0
 
 
