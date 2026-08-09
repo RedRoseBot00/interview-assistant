@@ -9,6 +9,12 @@ inglese o qualunque altra lingua senza configurare nulla.
 Il motore consuma i blocchi audio gia' etichettati per interlocutore
 prodotti da app.audio.capture e restituisce frasi attribuite a "Tu"
 (microfono) o al "Candidato" (audio della videochiamata).
+
+Qui avviene anche la gestione dell'eco: quando il selezionatore non usa
+le cuffie, il microfono ricattura la voce che esce dagli altoparlanti.
+I blocchi del microfono vengono quindi confrontati con l'audio che il
+computer stava riproducendo nello stesso istante e, se risultano una
+copia di quello, scartati o ripuliti (vedi app/audio/echo.py).
 """
 from __future__ import annotations
 
@@ -16,13 +22,14 @@ import logging
 import queue
 import threading
 import time
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 import numpy as np
 
 from app import config
+from app.audio import echo as echo_module
 from app.audio.capture import AudioChunk, rms_level
 
 log = logging.getLogger(__name__)
@@ -31,6 +38,14 @@ log = logging.getLogger(__name__)
 # contesto precedente non serve piu' a togliere le ripetizioni: due
 # frasi identiche pronunciate a distanza sono due frasi diverse.
 CONTEXT_EXPIRY_SECONDS = config.TRANSCRIBE_CHUNK_SECONDS * 2.5
+
+# Quanto un blocco del microfono puo' restare in attesa dell'audio di
+# riferimento prima di essere trascritto comunque.
+REFERENCE_WAIT_SECONDS = 2.5
+
+# Finestra temporale entro cui due frasi uguali su canali diversi sono
+# considerate la stessa frase (eco), non due interventi distinti.
+DUPLICATE_WINDOW_SECONDS = 12.0
 
 
 @dataclass
@@ -60,9 +75,7 @@ def _strip_overlap(previous: str, current: str, max_words: int = 8) -> str:
 
     I blocchi audio si sovrappongono di qualche decimo di secondo per
     non troncare le parole a meta', quindi l'inizio di una trascrizione
-    puo' ripetere la fine della precedente. Qui cerchiamo la piu' lunga
-    coda di 'previous' che coincide con la testa di 'current' e la
-    togliamo.
+    puo' ripetere la fine della precedente.
 
     Due accorgimenti: la sovrapposizione tipica e' di una o due parole,
     quindi va considerato anche il caso di una sola parola (purche' non
@@ -79,13 +92,13 @@ def _strip_overlap(previous: str, current: str, max_words: int = 8) -> str:
 
     for size in range(limit, 0, -1):
         if size >= len(curr_words):
-            continue  # non consumare l'intera frase
+            continue
         tail = [_normalise(w) for w in prev_words[-size:]]
         head = [_normalise(w) for w in curr_words[:size]]
         if tail != head:
             continue
         if size == 1 and len(tail[0]) < 4:
-            continue  # "e", "che", "ok": ripetizioni legittime
+            continue
         return " ".join(curr_words[size:]).strip()
     return current
 
@@ -97,6 +110,7 @@ class TranscriptionEngine:
         self,
         model_size: str = config.WHISPER_MODEL_SIZE_DEFAULT,
         language: str = "auto",
+        echo_mode: str = echo_module.MODE_AUTO,
         on_segment: Optional[Callable[[TranscriptSegment], None]] = None,
         on_status: Optional[Callable[[str], None]] = None,
         on_error: Optional[Callable[[Exception], None]] = None,
@@ -120,6 +134,13 @@ class TranscriptionEngine:
         self._last_offset: dict[str, float] = {}
         self._lock = threading.Lock()
 
+        # Gestione dell'eco
+        self.echo = echo_module.EchoProcessor(echo_mode, config.AUDIO_SAMPLE_RATE)
+        self._reference = echo_module.ReferenceBuffer(config.AUDIO_SAMPLE_RATE)
+        self._waiting: deque[tuple[AudioChunk, float]] = deque()
+        self.echo_dropped = 0
+        self.duplicates_dropped = 0
+
     # ------------------------------------------------------------------
     def load_model(self) -> None:
         """Carica il modello in memoria. Operazione lenta: mai dal thread grafico."""
@@ -129,8 +150,8 @@ class TranscriptionEngine:
 
         if not whisper_model_present(self.model_size):
             raise RuntimeError(
-                f"Il modello di trascrizione '{self.model_size}' non e' installato. "
-                "Riavvia l'applicazione per completarne il download."
+                f"Il modello di trascrizione '{self.model_size}' non e' installato "
+                "o e' incompleto. Riavvia l'applicazione per completarne il download."
             )
 
         self._notify_status("Caricamento del modello di trascrizione...")
@@ -171,8 +192,7 @@ class TranscriptionEngine:
         thread.join(timeout=timeout)
         if thread.is_alive():
             log.warning(
-                "Trascrizione ancora in corso dopo %.0f s (%d blocchi arretrati): "
-                "attendo ancora.",
+                "Trascrizione ancora in corso dopo %.0f s (%d blocchi arretrati)",
                 timeout,
                 self.backlog,
             )
@@ -214,18 +234,26 @@ class TranscriptionEngine:
             try:
                 chunk = audio_queue.get(timeout=0.4)
             except queue.Empty:
-                if self._stop.is_set():
+                self._flush_waiting(force=self._stop.is_set())
+                if self._stop.is_set() and not self._waiting:
                     break
                 continue
 
-            self.backlog = audio_queue.qsize()
+            self.backlog = audio_queue.qsize() + len(self._waiting)
             try:
-                self._process(chunk)
+                self._accept(chunk)
             except Exception as exc:
-                log.exception("Errore durante la trascrizione di un blocco")
+                log.exception("Errore durante l'elaborazione di un blocco")
                 if self.on_error:
                     self.on_error(exc)
 
+        self._flush_waiting(force=True)
+        if self.echo_dropped or self.duplicates_dropped:
+            log.info(
+                "Eco gestita: %d blocchi scartati sul segnale, %d frasi duplicate",
+                self.echo_dropped,
+                self.duplicates_dropped,
+            )
         self._notify_status("Trascrizione conclusa")
 
     @staticmethod
@@ -236,7 +264,64 @@ class TranscriptionEngine:
         except queue.Empty:
             pass
 
-    def _process(self, chunk: AudioChunk) -> None:
+    # ------------------------------------------------------------------
+    # Smistamento dei blocchi
+    # ------------------------------------------------------------------
+    def _accept(self, chunk: AudioChunk) -> None:
+        if chunk.speaker == config.SPEAKER_CANDIDATE:
+            # L'audio della videochiamata e' anche il riferimento con cui
+            # riconoscere l'eco nel microfono.
+            if self.echo.enabled:
+                self._reference.append(chunk.offset, chunk.samples)
+            self._transcribe(chunk)
+            self._flush_waiting()
+            return
+
+        if not self.echo.enabled or not self._reference.active:
+            self._transcribe(chunk)
+            return
+
+        # Il blocco corrispondente dell'altro canale puo' non essere
+        # ancora arrivato: mettiamo il microfono in attesa per un istante
+        # invece di rinunciare al confronto.
+        self._waiting.append((chunk, time.monotonic()))
+        self._flush_waiting()
+
+    def _flush_waiting(self, force: bool = False) -> None:
+        while self._waiting:
+            chunk, arrived = self._waiting[0]
+            duration = chunk.samples.size / config.AUDIO_SAMPLE_RATE
+            needed = chunk.offset + duration + echo_module.MAX_DELAY_SECONDS
+            waited = time.monotonic() - arrived
+
+            if not force and not self._reference.covers(needed) and waited < REFERENCE_WAIT_SECONDS:
+                return
+
+            self._waiting.popleft()
+            reference = self._reference.segment(chunk.offset, duration)
+            samples = chunk.samples
+            if reference is not None:
+                reference_samples, pre_samples = reference
+                result = self.echo.process(
+                    chunk.samples, reference_samples, pre_samples
+                )
+                if result.is_echo:
+                    self.echo_dropped += 1
+                    log.debug(
+                        "Blocco microfono scartato come eco "
+                        "(somiglianza %.2f, ritardo %.0f ms)",
+                        result.correlation,
+                        result.delay_seconds * 1000,
+                    )
+                    continue
+                samples = result.samples
+
+            self._transcribe(AudioChunk(chunk.speaker, samples, chunk.offset, chunk.wall_time))
+
+    # ------------------------------------------------------------------
+    # Trascrizione vera e propria
+    # ------------------------------------------------------------------
+    def _transcribe(self, chunk: AudioChunk) -> None:
         if chunk.samples.size == 0 or self._model is None:
             return
 
@@ -289,6 +374,16 @@ class TranscriptionEngine:
             if not text:
                 return
 
+            # Ultima rete di sicurezza contro l'eco: la stessa frase
+            # comparsa poco fa sull'altro canale e' una ripetizione, non
+            # un intervento nuovo.
+            if self.echo.enabled and chunk.speaker == config.SPEAKER_RECRUITER:
+                if self._is_echo_of_candidate(text, chunk.offset):
+                    self.duplicates_dropped += 1
+                    self.echo.detections += 1
+                    log.debug("Frase scartata perche' duplicata dall'altro canale")
+                    return
+
             self._last_text[chunk.speaker] = text
             self._last_offset[chunk.speaker] = chunk.offset
             if detected:
@@ -306,6 +401,17 @@ class TranscriptionEngine:
         if self.on_segment:
             self.on_segment(segment)
 
+    def _is_echo_of_candidate(self, text: str, offset: float) -> bool:
+        """Da chiamare tenendo il lock."""
+        for segment in reversed(self.segments):
+            if offset - segment.offset_seconds > DUPLICATE_WINDOW_SECONDS:
+                break
+            if segment.speaker != config.SPEAKER_CANDIDATE:
+                continue
+            if echo_module.texts_are_duplicate(segment.text, text):
+                return True
+        return False
+
     # ------------------------------------------------------------------
     @property
     def detected_language(self) -> str:
@@ -319,6 +425,11 @@ class TranscriptionEngine:
             if not self._languages:
                 return ""
             return self._languages.most_common(1)[0][0]
+
+    @property
+    def speakers_detected(self) -> bool:
+        """True quando i dati indicano l'uso degli altoparlanti, non delle cuffie."""
+        return self.echo.speakers_detected
 
     def transcript_lines(self, labels: dict[str, str]) -> list[str]:
         with self._lock:
