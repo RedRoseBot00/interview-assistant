@@ -264,9 +264,20 @@ class VoiceSegmenter:
         emettere; altrimenti abbiamo esaminato tutto il flusso. Serve
         all'altro canale per sapere che qui, nel frattempo, c'era
         silenzio: anche l'assenza di suono e' un'informazione utile.
+
+        Il pre-roll va sottratto: quei frame sembrano gia' esaminati e
+        muti, ma se il parlato comincia subito dopo vengono rivendicati
+        dalla frase successiva, che risultera' iniziata PRIMA
+        dell'istante dichiarato definitivo. L'altro canale usa questo
+        valore per decidere di avere il riferimento completo: senza la
+        sottrazione, l'analisi dell'eco parte con un buco di quasi tre
+        decimi di secondo proprio in fondo alla finestra.
         """
-        frame = self._speech_start_frame if self._in_speech else self._consumed_frames
-        return frame * self.frame_size / self.sample_rate
+        if self._in_speech:
+            frame = self._speech_start_frame
+        else:
+            frame = self._consumed_frames - len(self._pre_roll)
+        return max(0, frame) * self.frame_size / self.sample_rate
 
     @property
     def speech_ratio(self) -> float:

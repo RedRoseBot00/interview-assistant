@@ -249,6 +249,7 @@ def _normalised_cross_correlation(
     reference: np.ndarray,
     pre_samples: int,
     max_lag_samples: int | None = None,
+    max_lead_samples: int = 0,
 ) -> tuple[float, int, float]:
     """
     Somiglianza massima fra microfono e riferimento al variare del
@@ -286,13 +287,29 @@ def _normalised_cross_correlation(
     max_lag = min(correlation.size - 1, reference.size - 1)
     if max_lag_samples is not None:
         max_lag = min(max_lag, max(1, max_lag_samples))
-    window = correlation[: max_lag + 1]
+
+    # Ritardi POSITIVI: l'eco segue la riproduzione, e' il caso fisico.
+    finestra = [correlation[: max_lag + 1]]
+    # Ritardi NEGATIVI: fisicamente impossibili, ma i due flussi audio
+    # sono catturati da thread distinti e un blocco di lettura perso su
+    # un canale sposta indietro la sua base tempi. Bastano tre blocchi
+    # (settanta millisecondi) perche' il ritardo apparente diventi
+    # negativo: cercando solo in avanti, da quel momento l'eco non
+    # veniva piu' riconosciuta per tutto il resto del colloquio, e ogni
+    # domanda compariva due volte nella trascrizione.
+    lead = min(int(max_lead_samples), correlation.size - max_lag - 1)
+    if lead > 0:
+        finestra.append(correlation[-lead:])
+    window = np.concatenate(finestra)
     if window.size == 0:
         return 0.0, 0, 0.0
 
     magnitudes = np.abs(window)
     best = int(np.argmax(magnitudes))
-    value = float(magnitudes[best]) / (mic_energy * ref_energy)
+    if best > max_lag:
+        # Indice nella coda dell'array: corrisponde a un ritardo negativo.
+        best = best - window.size
+    value = float(magnitudes[np.argmax(magnitudes)]) / (mic_energy * ref_energy)
 
     # Quanto il massimo spicca sul resto della curva. Serve a capire se
     # il ritardo trovato e' un'informazione reale o solo il punto piu'
@@ -482,10 +499,17 @@ class EchoProcessor:
         self.processed += 1
         # Il ritardo dell'eco non puo' superare i limiti fisici: cercare
         # oltre non serve e apre la porta a somiglianze casuali che
-        # farebbero scartare frasi vere del selezionatore.
-        limite = pre_samples + int(FORWARD_MARGIN_SECONDS * self.sample_rate)
+        # farebbero scartare frasi vere del selezionatore. All'indietro
+        # invece un margine serve davvero, per assorbire lo scarto fra
+        # le basi tempi dei due canali (vedi il commento nella ricerca
+        # del massimo): prima quel margine veniva sommato per errore al
+        # limite in avanti, dove non serviva a nulla.
         correlation, lag, prominence = _normalised_cross_correlation(
-            mic, reference, pre_samples, limite
+            mic,
+            reference,
+            pre_samples,
+            max_lag_samples=pre_samples,
+            max_lead_samples=int(FORWARD_MARGIN_SECONDS * self.sample_rate),
         )
         self.last_correlation = correlation
 

@@ -109,6 +109,10 @@ class AudioChunk:
     # Vero quando la frase e' il seguito di una troncata per durata
     # massima: solo in quel caso ha senso togliere le parole ripetute.
     continues_previous: bool = False
+    # Silenzio reinserito dall'accorpamento per ricostruire le pause.
+    # Va sottratto ogni volta che si ragiona su "quanto parlato c'e'":
+    # e' tempo, non voce.
+    padding_seconds: float = 0.0
 
 
 class AudioQueue(queue.Queue):
@@ -126,7 +130,18 @@ class AudioQueue(queue.Queue):
     def __init__(self, maxsize: int = 0, sample_rate: int = config.AUDIO_SAMPLE_RATE):
         super().__init__(maxsize=maxsize)
         self._sample_rate = float(max(1, sample_rate))
-        self.pending_seconds = 0.0
+        self._queued_seconds = 0.0
+        # Secondi gia' estratti dalla coda ma non ancora trascritti:
+        # il motore ne tiene da parte fino a trentadue per poterli
+        # accorpare. Senza contarli, il limite sull'arretrato guardava
+        # solo la punta dell'iceberg e non scattava mai: l'attesa reale
+        # poteva superare i cinque minuti con il contatore quasi a zero.
+        self.parked_seconds = 0.0
+
+    @property
+    def pending_seconds(self) -> float:
+        """Arretrato complessivo, in coda e in mano al motore."""
+        return self._queued_seconds + self.parked_seconds
 
     @staticmethod
     def _samples(item) -> int:
@@ -135,12 +150,12 @@ class AudioQueue(queue.Queue):
 
     def _put(self, item):
         super()._put(item)
-        self.pending_seconds += self._samples(item) / self._sample_rate
+        self._queued_seconds += self._samples(item) / self._sample_rate
 
     def _get(self):
         item = super()._get()
-        self.pending_seconds = max(
-            0.0, self.pending_seconds - self._samples(item) / self._sample_rate
+        self._queued_seconds = max(
+            0.0, self._queued_seconds - self._samples(item) / self._sample_rate
         )
         return item
 
@@ -148,39 +163,80 @@ class AudioQueue(queue.Queue):
 # --------------------------------------------------------------------------
 # Conversione del formato
 # --------------------------------------------------------------------------
-# Sotto questa soglia, rispetto al canale piu' forte, un canale e'
-# considerato spento: mediarlo insieme agli altri dimezzerebbe soltanto
-# il volume del segnale utile.
-_SILENT_CHANNEL_RATIO = 0.01   # -40 dB
-
-
-def to_mono(samples: np.ndarray, channels: int) -> np.ndarray:
+class ChannelMixer:
     """
-    Riduce a un canale solo.
+    Riduce a un canale solo, con una decisione STABILE nel tempo.
 
     La media aritmetica sembra la scelta ovvia, ma e' sbagliata nel caso
     piu' comune sui portatili: un microfono dichiarato stereo che porta
     il segnale su un canale solo e silenzio sull'altro. Mediandoli si
     perdono 6 dB, e il parlato finisce sotto le soglie di silenzio senza
-    che nulla lo segnali. Quando un canale e' palesemente muto usiamo
-    quindi soltanto quello attivo.
-    """
-    if channels <= 1:
-        # I dati provengono da un buffer di sola lettura: la copia evita
-        # che una futura elaborazione sul posto fallisca in modo oscuro.
-        return np.array(samples, dtype=np.float32, copy=True)
-    usable = (samples.size // channels) * channels
-    if usable == 0:
-        return np.zeros(0, dtype=np.float32)
+    che nulla lo segnali.
 
-    frame = samples[:usable].reshape(-1, channels)
-    energy = np.sqrt(np.mean(np.square(frame, dtype=np.float64), axis=0))
-    loudest = float(energy.max()) if energy.size else 0.0
-    if loudest > 0.0:
-        active = energy >= loudest * _SILENT_CHANNEL_RATIO
-        if not active.all():
-            return frame[:, active].mean(axis=1).astype(np.float32)
-    return frame.mean(axis=1).astype(np.float32)
+    Decidere blocco per blocco quali canali siano attivi era pero'
+    peggio del male: con un secondo canale che oscilla attorno alla
+    soglia (diafonia, respiro, una ventola) la configurazione cambiava
+    anche venti volte dentro la stessa frase, e ogni cambio produceva un
+    salto di volume di quasi 6 dB — un clic secco in mezzo a una parola,
+    che manda fuori giri sia la soglia del rilevatore di voce sia il
+    confronto con l'eco.
+
+    Qui la decisione si basa su una media che si muove lentamente e ha
+    due soglie diverse per entrare e per uscire, cosi' un canale al
+    limite non fa avanti e indietro.
+    """
+
+    ENTER_RATIO = 0.020    # sopra il 2% del canale piu' forte: e' attivo
+    LEAVE_RATIO = 0.008    # sotto lo 0,8%: e' spento
+    SMOOTHING = 0.15       # quanto pesa il blocco corrente sulla media
+
+    def __init__(self, channels: int):
+        self.channels = max(1, channels)
+        self._energy: np.ndarray | None = None
+        self._active: np.ndarray | None = None
+
+    def __call__(self, samples: np.ndarray) -> np.ndarray:
+        channels = self.channels
+        if channels <= 1:
+            # I dati provengono da un buffer di sola lettura: la copia
+            # evita che una futura elaborazione sul posto fallisca in
+            # modo oscuro.
+            return np.array(samples, dtype=np.float32, copy=True)
+
+        usable = (samples.size // channels) * channels
+        if usable == 0:
+            return np.zeros(0, dtype=np.float32)
+        frame = samples[:usable].reshape(-1, channels)
+
+        livello = np.sqrt(np.mean(np.square(frame, dtype=np.float64), axis=0))
+        if self._energy is None:
+            self._energy = livello
+        else:
+            self._energy = (
+                (1.0 - self.SMOOTHING) * self._energy + self.SMOOTHING * livello
+            )
+
+        forte = float(self._energy.max())
+        if forte > 0.0:
+            if self._active is None:
+                self._active = self._energy >= forte * self.ENTER_RATIO
+            else:
+                accesi = self._energy >= forte * self.ENTER_RATIO
+                spenti = self._energy < forte * self.LEAVE_RATIO
+                self._active = np.where(
+                    accesi, True, np.where(spenti, False, self._active)
+                )
+            if not self._active.any():
+                self._active = None
+
+        if self._active is not None and not self._active.all():
+            return frame[:, self._active].mean(axis=1).astype(np.float32)
+        return frame.mean(axis=1).astype(np.float32)
+
+
+def to_mono(samples: np.ndarray, channels: int) -> np.ndarray:
+    """Versione senza memoria, usata solo dalle prove automatiche."""
+    return ChannelMixer(channels)(samples)
 
 
 _FIR_CACHE: dict[tuple[int, int], np.ndarray] = {}
@@ -244,10 +300,18 @@ def resample(samples: np.ndarray, source_rate: int, target_rate: int) -> np.ndar
     if samples.size == 0 or source_rate == target_rate:
         return samples
 
-    if source_rate > target_rate and samples.size > 8:
-        samples = _convolve_same(samples, _antialias_kernel(source_rate, target_rate))
-
+    # La lunghezza va decisa PRIMA di filtrare: np.convolve in modalita'
+    # "same" restituisce max(segnale, filtro) campioni, quindi su un
+    # segnale piu' corto del filtro il risultato veniva gonfiato a 127
+    # campioni e la durata dichiarata triplicava.
     target_length = int(round(samples.size * target_rate / source_rate))
+
+    if source_rate > target_rate and samples.size > 8:
+        filtrato = _convolve_same(
+            samples, _antialias_kernel(source_rate, target_rate)
+        )
+        samples = filtrato[: samples.size]
+
     if target_length <= 0:
         return np.zeros(0, dtype=np.float32)
     if samples.size == 1:
@@ -431,6 +495,10 @@ class _SourceReader(threading.Thread):
         # dispositivo; la conversione a 16 kHz viene fatta una sola
         # volta, sulla frase completa.
         self._segmenter = VoiceSegmenter(device.sample_rate)
+        # Il riduttore a un canale conserva memoria fra un blocco e
+        # l'altro: la decisione su quali canali siano attivi deve
+        # restare la stessa per tutta la frase.
+        self._mixer = ChannelMixer(device.channels)
 
         # Scarto fra l'avvio della registrazione e il primo campione di
         # QUESTA sorgente. I due dispositivi non si aprono nello stesso
@@ -458,18 +526,23 @@ class _SourceReader(threading.Thread):
         )
         duration = samples.size / float(config.AUDIO_SAMPLE_RATE)
 
-        pending = getattr(self._output, "pending_seconds", 0.0)
-        while pending + duration > MAX_BACKLOG_SECONDS:
+        # Il numero di giri e' limitato invece di confrontare il
+        # contatore prima e dopo. Il confronto sembrava prudente ma si
+        # fermava al primo marcatore di silenzio incontrato — che dura
+        # zero secondi per definizione — e cosi' il limite sull'arretrato
+        # non scartava mai nulla: la coda cresceva indisturbata e i
+        # sottotitoli accumulavano minuti di ritardo senza alcun avviso.
+        for _ in range(QUEUE_HARD_LIMIT):
+            if getattr(self._output, "pending_seconds", 0.0) + duration <= (
+                MAX_BACKLOG_SECONDS
+            ):
+                break
             try:
                 stale = self._output.get_nowait()
             except queue.Empty:
                 break
             if getattr(stale.samples, "size", 0):
                 self.dropped_chunks += 1
-            nuovo = getattr(self._output, "pending_seconds", 0.0)
-            if nuovo >= pending:
-                break          # coda senza contatore: evitiamo il ciclo infinito
-            pending = nuovo
 
         try:
             self._output.put_nowait(chunk)
@@ -558,7 +631,7 @@ class _SourceReader(threading.Thread):
                 if samples.size == 0:
                     continue
 
-                mono = to_mono(samples, self.device.channels)
+                mono = self._mixer(samples)
                 if self._on_level is not None:
                     self._on_level(self.speaker, rms_level(mono))
 
@@ -621,18 +694,32 @@ class AudioRecorder:
         self._readers: list[_SourceReader] = []
         self._catalog: Optional[DeviceCatalog] = None
         self._pa_lock = threading.Lock()
+        # Avvio e arresto non possono sovrapporsi. Senza questo blocco,
+        # chi chiudeva la finestra nei primi secondi di un colloquio
+        # faceva chiamare terminate() su PortAudio mentre l'altro thread
+        # stava ancora aprendo gli stream: il programma spariva senza
+        # messaggio, ed era il guasto piu' difficile da riprodurre.
+        self._lifecycle = threading.Lock()
 
         self.active_sources: dict[str, str] = {}   # etichetta -> dispositivo
         self.warnings: list[str] = []
 
     # ------------------------------------------------------------------
     def start(self) -> None:
+        with self._lifecycle:
+            self._start_locked()
+
+    def _start_locked(self) -> None:
         if self._readers:
             return
+        # Un arresto gia' richiesto ha la precedenza: aprire adesso i
+        # dispositivi significherebbe lasciarli aperti per sempre,
+        # perche' chi doveva chiuderli ha gia' fatto il suo giro.
+        if self._stop.is_set():
+            raise AudioError("Registrazione annullata prima dell'avvio.")
 
         self.warnings.clear()
         self.active_sources.clear()
-        self._stop.clear()
 
         catalog = DeviceCatalog()
         try:
@@ -738,12 +825,22 @@ class AudioRecorder:
         PortAudio: chiuderlo mentre uno stream e' ancora aperto in un
         altro thread provoca la chiusura immediata del programma.
         """
+        # Il segnale di arresto va dato PRIMA di prendere il blocco: se
+        # un avvio e' in corso deve accorgersene subito, e noi dobbiamo
+        # aspettare che finisca invece di chiudere sotto i suoi piedi.
         self._stop.set()
+        with self._lifecycle:
+            return self._stop_locked(timeout)
 
-        deadline = time.monotonic() + timeout
+    def _stop_locked(self, timeout: float) -> bool:
+        # Ogni sorgente ha il proprio tempo di attesa. Con una scadenza
+        # unica, una sorgente lenta consumava tutto il budget e la
+        # seconda riceveva join(0): veniva dichiarata "ancora attiva"
+        # anche se stava per finire, PortAudio non veniva chiuso e il
+        # colloquio successivo trovava i dispositivi occupati.
         still_alive: list[_SourceReader] = []
         for reader in self._readers:
-            reader.join(timeout=max(0.0, deadline - time.monotonic()))
+            reader.join(timeout=timeout)
             if reader.is_alive():
                 still_alive.append(reader)
 
