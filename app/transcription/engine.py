@@ -3,8 +3,8 @@ Motore di trascrizione in tempo reale.
 
 Basato su faster-whisper (Whisper eseguito da CTranslate2): gira in
 locale, senza connessione e senza costi, e riconosce automaticamente
-circa 99 lingue, quindi il colloquio puo' svolgersi in italiano,
-inglese o qualunque altra lingua senza configurare nulla.
+circa 99 lingue: il colloquio puo' svolgersi in qualunque lingua
+senza configurare nulla, e nessuna lingua e' privilegiata.
 
 Il motore consuma i blocchi audio gia' etichettati per interlocutore
 prodotti da app.audio.capture e restituisce frasi attribuite a "Tu"
@@ -59,8 +59,34 @@ MERGE_LOOKAHEAD = 32
 # Quando la coda cresce, l'unica cosa che conta e' tornare al presente:
 # si accorpa fino al limite di durata ignorando la lunghezza delle
 # pause, dimezzando il numero di chiamate al riconoscimento vocale.
-BACKLOG_AGGRESSIVE_MERGE = 3
+# L'arretrato va misurato in SECONDI di parlato, non in numero di
+# elementi: gli avvisi di silenzio dell'altro canale sono elementi che
+# valgono zero secondi, e ne arrivano due al secondo. Contandoli, la
+# condizione "sono in ritardo" risultava vera quasi sempre, anche a coda
+# vuota, e il programma restava perennemente in modalita' di emergenza.
+BACKLOG_AGGRESSIVE_SECONDS = 8.0
 BACKLOG_GAP_SECONDS = 6.0
+
+# --------------------------------------------------------------------------
+# Adattamento automatico del modello
+# --------------------------------------------------------------------------
+# Whisper elabora sempre una finestra di trenta secondi: il costo dipende
+# dal NUMERO di chiamate, non da quanto parlato contengono. In un
+# colloquio le battute si alternano fra due persone circa venti volte al
+# minuto, e ogni battuta e' una chiamata. Se una chiamata costa piu' del
+# tempo che passa fra una battuta e l'altra, il ritardo non si stabilizza
+# mai: cresce per tutta la durata del colloquio.
+#
+# Non c'e' accorpamento che possa rimediare — le battute consecutive sono
+# di persone diverse e vanno trascritte separatamente. L'unica leva vera
+# e' il costo della singola chiamata, cioe' la dimensione del modello.
+#
+# Il programma se ne accorge da solo e scende di un gradino, spiegando
+# perche'. Meglio un modello un po' meno preciso che sta al passo, che
+# uno migliore i cui sottotitoli arrivano un minuto dopo la voce.
+OVERLOAD_RATIO = 1.15          # oltre questo carico non si sta al passo
+OVERLOAD_MIN_CALLS = 8         # non si decide su due misure
+MODEL_LADDER = ("medium", "small", "base", "tiny")
 
 # Ogni quante frasi lunghe si lascia il modello libero di ridire la sua
 # sulla lingua, per potersi ricredere su un blocco iniziale sbagliato.
@@ -159,10 +185,13 @@ def _normalise(word: str) -> str:
 def _echoes_prompt(text: str) -> bool:
     """La trascrizione e' solo una copia del suggerimento di contesto?"""
     pulito = " ".join(_normalise(w) for w in text.split())
-    modello = " ".join(_normalise(w) for w in config.TRANSCRIPTION_PROMPT.split())
     if not pulito:
         return False
-    return pulito == modello or (len(pulito) > 20 and pulito in modello)
+    for frase in config.TRANSCRIPTION_PROMPTS.values():
+        modello = " ".join(_normalise(w) for w in frase.split())
+        if pulito == modello or (len(pulito) > 20 and pulito in modello):
+            return True
+    return False
 
 
 def _strip_overlap(previous: str, current: str, max_words: int = 8) -> str:
@@ -223,8 +252,8 @@ class TranscriptionEngine:
 
         # Lingua: si riconosce nei primi interventi e poi si fissa. Il
         # riconoscimento automatico ripetuto a ogni frase costa tempo e,
-        # sulle frasi brevi, sbaglia spesso attribuendo parole italiane
-        # a un'altra lingua.
+        # sulle frasi brevi, sbaglia spesso attribuendo il parlato
+        # alla lingua sbagliata.
         self._locked_language: Optional[str] = (
             None if language == "auto" else language
         )
@@ -241,10 +270,21 @@ class TranscriptionEngine:
         # Rapporto fra durata dell'audio e tempo impiegato a trascriverlo.
         self.realtime_factor = 0.0
         self._speed_samples = 0
+        # Secondi di orologio spesi in media per una chiamata al
+        # riconoscimento vocale, qualunque sia la durata dell'audio.
+        self._call_cost = 0.0
+        # Ritmo con cui il rilevatore di voce produce le frasi.
+        self._arrival_gap = 0.0
+        self._last_arrival: Optional[float] = None
+        # Alleggerimento automatico del modello: una volta sola.
+        self._downgraded = False
+        self.model_changed_to = ""
         # 0 = minimo indispensabile, 1 = ricerca media, 2 = ricerca ampia.
-        # Si parte dal livello medio: sui computer che reggono resta li'
-        # o sale, su quelli lenti scende dopo le prime frasi.
-        self._quality_level = 1
+        # Si parte dal MINIMO e si sale solo dopo aver misurato che il
+        # computer regge. Partendo dal livello medio, le prime frasi di
+        # ogni colloquio erano lente proprio sulle macchine modeste, e
+        # bastavano a creare un arretrato da cui non si rientrava piu'.
+        self._quality_level = 0
 
         self.segments: list[TranscriptSegment] = []
         self.backlog = 0
@@ -431,15 +471,64 @@ class TranscriptionEngine:
             blocco = self._local.popleft()
             self._update_parked(audio_queue)
             return blocco
-        return audio_queue.get(timeout=timeout)
+        blocco = audio_queue.get(timeout=timeout)
+        self._note_arrival(blocco)
+        return blocco
 
     def _fill_local(self, audio_queue: "queue.Queue[AudioChunk]") -> None:
         try:
             while len(self._local) < MERGE_LOOKAHEAD:
-                self._local.append(audio_queue.get_nowait())
+                nuovo = audio_queue.get_nowait()
+                self._local.append(nuovo)
+                self._note_arrival(nuovo)
         except queue.Empty:
             pass
         self._update_parked(audio_queue)
+
+    def _note_arrival(self, chunk: AudioChunk) -> None:
+        """
+        Ogni quanto vengono prodotte le frasi, in secondi di orologio.
+
+        Si misura sull'istante di NASCITA del blocco, non su quando lo
+        preleviamo noi: cosi' il valore descrive il ritmo di chi parla e
+        non quanto siamo indietro. E' il termine di paragone con cui
+        decidere se conviene aspettare.
+        """
+        if chunk.samples.size == 0:
+            return
+        precedente = self._last_arrival
+        self._last_arrival = chunk.wall_time
+        if precedente is None:
+            return
+        distanza = chunk.wall_time - precedente
+        if not (0.0 < distanza < 60.0):
+            return
+        if self._arrival_gap <= 0:
+            self._arrival_gap = distanza
+        else:
+            self._arrival_gap = 0.7 * self._arrival_gap + 0.3 * distanza
+
+    def _mergeable_seconds(self, speaker: str) -> float:
+        """
+        Parlato in attesa che finira' DAVVERO nella prossima chiamata.
+
+        L'accorpamento si ferma al primo blocco di un altro
+        interlocutore: conta quindi solo la testa della coda locale,
+        esattamente come fara' _merge_following.
+        """
+        totale = 0.0
+        for blocco in self._local:
+            if blocco.samples.size == 0:
+                continue      # avviso di silenzio: non ferma la fusione
+            if blocco.speaker != speaker or blocco.continues_previous:
+                break
+            totale += blocco.samples.size / float(config.AUDIO_SAMPLE_RATE)
+        return totale
+
+    def _durata_locale(self) -> float:
+        return sum(c.samples.size for c in self._local) / float(
+            config.AUDIO_SAMPLE_RATE
+        )
 
     def _update_parked(self, audio_queue) -> None:
         """
@@ -472,11 +561,11 @@ class TranscriptionEngine:
         if chunk.samples.size == 0:
             return chunk
 
+        rate = config.AUDIO_SAMPLE_RATE
         self._fill_local(audio_queue)
         if not self._local:
             return chunk
 
-        rate = config.AUDIO_SAMPLE_RATE
         parti = [chunk.samples]
         fine = chunk.offset + chunk.samples.size / rate
         uniti = 0
@@ -490,16 +579,25 @@ class TranscriptionEngine:
         # In arretrato conta solo smaltire: si accorpa anche attraverso
         # pause piu' lunghe, perche' una chiamata da venti secondi costa
         # quanto quattro da cinque.
-        in_ritardo = (
-            len(self._local) + len(self._waiting) >= BACKLOG_AGGRESSIVE_MERGE
-        )
+        in_ritardo = self._durata_locale() >= BACKLOG_AGGRESSIVE_SECONDS
         pausa_massima = BACKLOG_GAP_SECONDS if in_ritardo else MERGE_GAP_SECONDS
 
         while self._local:
             successiva = self._local[0]
+            if successiva.samples.size == 0:
+                # Avviso di silenzio dell'altro canale: non deve fermare
+                # l'accorpamento e non va rimandato. Elaborarlo subito
+                # tiene aggiornato il riferimento per il riconoscimento
+                # dell'eco, che altrimenti scadeva proprio mentre noi
+                # accorpavamo.
+                self._local.popleft()
+                try:
+                    self._accept(successiva)
+                except Exception:
+                    log.debug("Avviso di silenzio non elaborato", exc_info=True)
+                continue
             if (
                 successiva.speaker != chunk.speaker
-                or successiva.samples.size == 0
                 or successiva.continues_previous
             ):
                 break
@@ -535,6 +633,7 @@ class TranscriptionEngine:
             fine = successiva.offset + successiva.samples.size / rate
             uniti += 1
 
+        self._update_parked(audio_queue)
         if not uniti:
             return chunk
 
@@ -801,14 +900,25 @@ class TranscriptionEngine:
         primo tentativo e' venuto male; a variare e' solo quanto in
         profondita' si cerca.
         """
-        arretrato = len(self._local) + len(self._waiting)
-        veloce = self.realtime_factor
+        # Il margine NON si misura piu' con realtime_factor. Da quando
+        # l'attesa regola quanto audio entra in ogni chiamata, quel
+        # rapporto tende a fissarsi sul fattore di margine scelto — circa
+        # 1,6 su qualunque computer — e finisce nella fascia morta fra le
+        # due soglie: la qualita' non sarebbe mai piu' salita, nemmeno
+        # sulle macchine che potevano permetterselo. Confrontiamo invece
+        # due grandezze che il programma non controlla: quanto costa una
+        # chiamata e ogni quanto vengono prodotte le frasi.
+        arretrato = self._durata_locale()
+        if self._call_cost > 0 and self._arrival_gap > 0:
+            margine = self._arrival_gap / self._call_cost
+        else:
+            margine = 0.0
 
-        if arretrato >= BACKLOG_AGGRESSIVE_MERGE or (
-            self._speed_samples and veloce < config.SPEED_LOWER_QUALITY
+        if arretrato >= BACKLOG_AGGRESSIVE_SECONDS or (
+            margine and margine < config.SPEED_LOWER_QUALITY
         ):
             self._quality_level = 0
-        elif self._speed_samples >= 3 and veloce >= config.SPEED_RAISE_QUALITY:
+        elif self._speed_samples >= 3 and margine >= config.SPEED_RAISE_QUALITY:
             self._quality_level = min(2, self._quality_level + 1)
 
         if self._quality_level >= 2:
@@ -819,17 +929,17 @@ class TranscriptionEngine:
 
     def _prompt_for_call(self, language: Optional[str]) -> Optional[str]:
         """
-        Il suggerimento di contesto va dato solo nella sua lingua.
+        Suggerimento di contesto nella lingua del colloquio.
 
-        Passarlo sempre significava spingere verso l'italiano anche un
-        colloquio in inglese, e — su frasi brevi o disturbate — indurre
-        il modello a restituire il suggerimento stesso al posto di cio'
-        che aveva sentito, riempiendo la trascrizione di righe che
-        nessuno aveva pronunciato.
+        Va dato solo quando la lingua e' nota e solo nella lingua
+        parlata: un suggerimento scritto in un'altra lingua spinge il
+        modello verso quella sbagliata. Nessuna lingua e' privilegiata —
+        chi non ha un suggerimento in tabella semplicemente non lo
+        riceve, che e' la scelta neutra e senza effetti collaterali.
         """
-        if language != config.TRANSCRIPTION_PROMPT_LANGUAGE:
+        if not language:
             return None
-        return config.TRANSCRIPTION_PROMPT
+        return config.TRANSCRIPTION_PROMPTS.get(language)
 
     def _should_probe_language(self, duration: float) -> bool:
         """Vero quando conviene rifare il riconoscimento della lingua."""
@@ -924,6 +1034,19 @@ class TranscriptionEngine:
     def _record_speed(self, audio_seconds: float, elapsed: float) -> None:
         if audio_seconds <= 0 or elapsed <= 0:
             return
+        # Costo medio di UNA chiamata, indipendente da quanto audio
+        # conteneva: e' il numero su cui si decide quanto accorpare.
+        #
+        # La primissima chiamata non fa testo: comprende il riscaldamento
+        # delle librerie di calcolo e puo' costare il doppio delle
+        # successive. Prendendola come valore iniziale della media, le
+        # prime attese risultavano sovrastimate per diversi minuti.
+        if self._speed_samples == 0:
+            pass
+        elif self._call_cost <= 0:
+            self._call_cost = elapsed
+        else:
+            self._call_cost = 0.75 * self._call_cost + 0.25 * elapsed
         factor = audio_seconds / elapsed
         # Media mobile: un singolo intervento anomalo non deve far
         # sembrare il programma piu' lento o piu' veloce di quanto sia.
@@ -932,6 +1055,118 @@ class TranscriptionEngine:
         else:
             self.realtime_factor = 0.8 * self.realtime_factor + 0.2 * factor
         self._speed_samples += 1
+        self._consider_lighter_model()
+
+    # ------------------------------------------------------------------
+    @property
+    def load(self) -> float:
+        """
+        Quanto e' occupato il processore, da 0 a oltre 1.
+
+        E' il rapporto fra il costo di una chiamata e l'intervallo con
+        cui arrivano le frasi. Sopra 1 si consuma piu' tempo di quanto ne
+        passi: il ritardo dei sottotitoli cresce e non si riassorbe piu'.
+        """
+        if self._call_cost <= 0 or self._arrival_gap <= 0:
+            return 0.0
+        return self._call_cost / self._arrival_gap
+
+    def _consider_lighter_model(self) -> None:
+        """
+        Passa a un modello piu' leggero se questo non sta al passo.
+
+        Si interviene una volta sola e solo su misure abbondanti: e' un
+        cambiamento visibile all'utente e non deve avvenire per una
+        raffica passeggera. Se e' stato l'utente a scegliere il modello,
+        non si tocca nulla — si limita ad avvisare.
+        """
+        if self._downgraded or self._speed_samples < OVERLOAD_MIN_CALLS:
+            return
+        if self.load <= OVERLOAD_RATIO:
+            return
+
+        try:
+            posizione = MODEL_LADDER.index(self.model_size)
+        except ValueError:
+            return
+        if posizione + 1 >= len(MODEL_LADDER):
+            return
+        piu_leggero = MODEL_LADDER[posizione + 1]
+
+        self._downgraded = True     # in ogni caso non si riprova
+
+        from app import settings
+
+        # In "user_choices" stanno i NOMI delle impostazioni scelte a
+        # mano, non i loro valori: confrontarci la dimensione del
+        # modello dava sempre falso, e la scelta dell'utente sarebbe
+        # stata scavalcata in silenzio.
+        if "whisper_model_size" in (settings.get("user_choices") or ()):
+            self._notify_status(
+                f"Il modello '{self.model_size}' non sta al passo su questo "
+                "computer: i sottotitoli accumulano ritardo. Lo hai scelto tu, "
+                "quindi non lo cambio: se vuoi, passa a un modello piu' "
+                "leggero dalle impostazioni."
+            )
+            return
+
+        from app.models.download import whisper_model_present
+
+        if not whisper_model_present(piu_leggero):
+            self._notify_status(
+                f"Il modello '{self.model_size}' non sta al passo su questo "
+                "computer. Al termine del colloquio passa a un modello piu' "
+                "leggero dalle impostazioni."
+            )
+            return
+
+        log.warning(
+            "Carico %.2f con il modello '%s': passo a '%s'",
+            self.load, self.model_size, piu_leggero,
+        )
+        self._notify_status(
+            f"Il modello '{self.model_size}' non riesce a stare al passo: "
+            f"passo a '{piu_leggero}' per non far accumulare ritardo ai "
+            "sottotitoli."
+        )
+        try:
+            self._swap_model(piu_leggero)
+        except Exception:
+            log.exception("Cambio del modello non riuscito: proseguo con quello attuale")
+
+    def _swap_model(self, nuovo: str) -> None:
+        """
+        Sostituisce il modello in corsa.
+
+        Avviene fra una chiamata e l'altra, nello stesso thread che le
+        esegue: nessuno sta usando il modello in questo istante. Il
+        vecchio viene lasciato andare PRIMA di caricare il nuovo, per non
+        tenere in memoria entrambi su un computer che e' gia' in
+        difficolta'.
+        """
+        from faster_whisper import WhisperModel
+
+        from app.models.download import whisper_model_dir
+
+        self._model = None
+        import gc
+
+        gc.collect()
+
+        self.model_size = nuovo
+        self._model = WhisperModel(
+            str(whisper_model_dir(nuovo)),
+            device="cpu",
+            compute_type=config.WHISPER_COMPUTE_TYPE,
+            cpu_threads=config.transcription_threads(),
+            num_workers=1,
+        )
+        self.model_changed_to = nuovo
+        # Le misure precedenti riguardavano un altro modello.
+        self._call_cost = 0.0
+        self._speed_samples = 0
+        self.realtime_factor = 0.0
+        log.info("Modello di trascrizione sostituito con '%s'", nuovo)
 
     def _is_echo_of_candidate(self, text: str, offset: float) -> bool:
         """Da chiamare tenendo il lock."""
