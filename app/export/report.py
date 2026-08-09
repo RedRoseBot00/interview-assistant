@@ -77,6 +77,15 @@ def export_txt(
         f"Data: {interview.display_date}",
         f"Durata: {_format_duration(interview.duration_seconds)}",
         f"Lingua rilevata: {interview.detected_language or 'non rilevata'}",
+    ]
+    # Esperienza e competenze le inserisce l'utente durante il colloquio.
+    # Senza queste righe erano dati in sola scrittura: finivano
+    # nell'archivio e non ricomparivano piu' da nessuna parte.
+    if interview.experience:
+        lines.append(f"Esperienza: {interview.experience}")
+    if interview.skills:
+        lines.append(f"Competenze: {interview.skills}")
+    lines += [
         "",
         "=== REPORT ===",
         interview.report or "(nessun report)",
@@ -114,6 +123,12 @@ def export_docx(
     meta.add_run(f"{_format_duration(interview.duration_seconds)}\n")
     meta.add_run("Lingua rilevata: ").bold = True
     meta.add_run(interview.detected_language or "non rilevata")
+    if interview.experience:
+        meta.add_run("\nEsperienza: ").bold = True
+        meta.add_run(interview.experience)
+    if interview.skills:
+        meta.add_run("\nCompetenze: ").bold = True
+        meta.add_run(interview.skills)
 
     document.add_heading("Report", level=1)
     if not interview.used_llm and interview.report:
