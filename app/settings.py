@@ -42,11 +42,10 @@ def _default_model_size() -> str:
     Modello proposto alla prima installazione, in base al processore.
 
     La scelta e' cambiata dopo aver constatato sul campo che 'base'
-    trascrive l'inglese in modo accettabile ma l'italiano quasi sempre
-    male. Non e' un caso: Whisper e' addestrato per circa due terzi su
-    materiale inglese, e nei modelli piccoli la differenza fra le
-    lingue e' enorme. Un programma pensato per colloqui in italiano non
-    puo' partire dal modello che proprio in italiano non capisce.
+    produce spesso un testo poco comprensibile. Nei modelli piu'
+    piccoli la precisione varia molto da lingua a lingua, e un
+    programma che deve funzionare in qualunque lingua non puo' partire
+    dal modello che in diverse di esse non capisce.
 
     'small' resta quindi il predefinito ovunque ci sia almeno un paio
     di core veri; 'base' solo dove non c'e' alternativa. La velocita' se

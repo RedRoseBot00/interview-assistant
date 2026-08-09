@@ -11,7 +11,7 @@ from pathlib import Path
 
 APP_NAME = "InterviewAssistant"
 APP_DISPLAY_NAME = "Interview Assistant"
-APP_VERSION = "3.1.0"
+APP_VERSION = "3.2.0"
 
 # --------------------------------------------------------------------------
 # Percorsi applicazione
@@ -97,9 +97,9 @@ WHISPER_COMPUTE_TYPE = "int8"  # quantizzato: gira su CPU senza GPU dedicata
 # Il costo e' asimmetrico e conviene: sui blocchi riusciti al primo colpo
 # non si paga nulla, perche' i tentativi successivi non vengono
 # nemmeno eseguiti. Si paga solo dove il risultato sarebbe stato da
-# buttare — ed e' li' che serve. Sull'italiano, dove i modelli piccoli
-# entrano in ciclo di ripetizioni molto piu' spesso che sull'inglese,
-# questa e' la differenza fra una trascrizione leggibile e una inutile.
+# buttare — ed e' li' che serve. E' la differenza fra una trascrizione
+# leggibile e una inutile, tanto piu' marcata quanto piu' il modello e'
+# piccolo e la lingua parlata e' poco rappresentata nel suo addestramento.
 DECODE_TEMPERATURES_FULL = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
 DECODE_TEMPERATURES_FAST = (0.0, 0.4)
 
@@ -205,13 +205,28 @@ TRANSCRIBE_OVERLAP_SECONDS = 0.6
 # Suggerimento dato al riconoscimento vocale: orienta il modello sul
 # lessico di un colloquio di lavoro e migliora la punteggiatura.
 #
-# Va usato SOLO quando la lingua del colloquio e' l'italiano. Un
-# suggerimento italiano dato a un colloquio in inglese sposta il modello
-# verso la lingua sbagliata; e su frasi brevi o disturbate Whisper
-# tende a restituire il suggerimento stesso al posto di cio' che ha
-# sentito, riempiendo la trascrizione di righe inventate.
-TRANSCRIPTION_PROMPT = "Colloquio di lavoro tra un selezionatore e un candidato."
-TRANSCRIPTION_PROMPT_LANGUAGE = "it"
+# Va dato NELLA LINGUA del colloquio, e solo quando quella lingua e'
+# stata riconosciuta con certezza. Un suggerimento scritto in una lingua
+# diversa da quella parlata spinge il modello verso la lingua sbagliata;
+# e su frasi brevi o disturbate Whisper tende a restituire il
+# suggerimento stesso al posto di cio' che ha sentito.
+#
+# Il programma non privilegia alcuna lingua: ogni lingua supportata ha
+# il proprio suggerimento, con lo stesso identico significato. Per le
+# lingue non presenti in questa tabella non viene dato alcun
+# suggerimento, che e' la scelta neutra.
+TRANSCRIPTION_PROMPTS = {
+    "it": "Colloquio di lavoro tra un selezionatore e un candidato.",
+    "en": "Job interview between a recruiter and a candidate.",
+    "es": "Entrevista de trabajo entre un reclutador y un candidato.",
+    "fr": "Entretien d'embauche entre un recruteur et un candidat.",
+    "de": "Vorstellungsgesprach zwischen einem Personalverantwortlichen "
+          "und einem Bewerber.",
+    "pt": "Entrevista de emprego entre um recrutador e um candidato.",
+    "nl": "Sollicitatiegesprek tussen een recruiter en een kandidaat.",
+    "ro": "Interviu de angajare intre un recrutor si un candidat.",
+    "pl": "Rozmowa kwalifikacyjna miedzy rekruterem a kandydatem.",
+}
 
 # Quante frasi concordi servono per fissare la lingua del colloquio.
 #
