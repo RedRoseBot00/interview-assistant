@@ -30,6 +30,34 @@ log = logging.getLogger(__name__)
 # davanti a una schermata ferma dopo un errore grave del processo figlio.
 SELFTEST_TIMEOUT_SECONDS = 180
 
+# Codici di uscita che indicano una terminazione da parte del sistema
+# operativo, non un errore del programma. Solo questi giustificano il
+# passaggio alla modalita' compatibilita': un modello mancante o una
+# eccezione Python non hanno nulla a che vedere con le istruzioni della
+# CPU, e ripiegare su kernel generici renderebbe l'app cinque volte
+# piu' lenta per sempre, senza risolvere nulla.
+_STATUS_ILLEGAL_INSTRUCTION = 0xC000001D
+_STATUS_ACCESS_VIOLATION = 0xC0000005
+_STATUS_PRIVILEGED_INSTRUCTION = 0xC0000096
+
+
+def _is_native_crash(code: int) -> bool:
+    """True se il processo figlio e' stato ucciso dal sistema operativo."""
+    if code == 0:
+        return False
+    if sys.platform == "win32":
+        # Windows restituisce il codice come intero con segno: lo
+        # riportiamo alla forma a 32 bit senza segno prima di confrontarlo.
+        unsigned = code & 0xFFFFFFFF
+        return unsigned in (
+            _STATUS_ILLEGAL_INSTRUCTION,
+            _STATUS_ACCESS_VIOLATION,
+            _STATUS_PRIVILEGED_INSTRUCTION,
+        )
+    # Su Unix un codice negativo e' il numero del segnale ricevuto
+    # (SIGILL = 4, SIGSEGV = 11).
+    return code in (-4, -11)
+
 
 @dataclass
 class SelfTestResult:
@@ -110,7 +138,7 @@ def run_transcription_selftest(whisper_size: str) -> SelfTestResult:
         attempts = [True] if compat.is_emulated() else [False, True]
 
     last_detail = ""
-    for force_generic in attempts:
+    for index, force_generic in enumerate(attempts):
         log.info(
             "Test di avvio del motore di trascrizione (compatibilita'=%s)",
             force_generic,
@@ -121,6 +149,20 @@ def run_transcription_selftest(whisper_size: str) -> SelfTestResult:
             log.info("Test superato (compatibilita'=%s)", force_generic)
             return SelfTestResult(True, force_generic, detail)
         log.warning("Test fallito con codice %s: %s", code, detail[:2000])
+
+        # Il ripiego sui kernel generici ha senso solo se il processo
+        # figlio e' stato ucciso dal sistema operativo. Se invece si e'
+        # fermato da solo (modello mancante, eccezione Python, tempo
+        # scaduto) riprovare piu' lentamente fallirebbe allo stesso
+        # modo, con l'aggravante di lasciare in memoria l'esito
+        # "serve la modalita' compatibilita'" per sempre.
+        remaining = index + 1 < len(attempts)
+        if remaining and not _is_native_crash(code):
+            log.info(
+                "Il test non e' fallito per istruzioni non supportate: "
+                "non attivo la modalita' compatibilita'."
+            )
+            break
 
     return SelfTestResult(False, False, last_detail)
 
@@ -152,6 +194,10 @@ def selftest_transcription_child() -> int:
             str(whisper_model_dir(size)),
             device="cpu",
             compute_type=config.WHISPER_COMPUTE_TYPE,
+            # Stessi thread dell'uso reale: il test deve esercitare la
+            # stessa configurazione, altrimenti verifica qualcos'altro.
+            cpu_threads=config.transcription_threads(),
+            num_workers=1,
         )
 
         # Un secondo di rumore molto debole: sufficiente a far girare

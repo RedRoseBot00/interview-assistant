@@ -11,7 +11,7 @@ from pathlib import Path
 
 APP_NAME = "InterviewAssistant"
 APP_DISPLAY_NAME = "Interview Assistant"
-APP_VERSION = "0.2.2"
+APP_VERSION = "3.0.0"
 
 # --------------------------------------------------------------------------
 # Percorsi applicazione
@@ -99,18 +99,113 @@ LLM_MODEL_PATH = MODELS_DIR / LLM_MODEL_FILENAME
 # Il file completo pesa circa 2,0 GB: sotto questa soglia si tratta
 # certamente di un download interrotto, non di un modello utilizzabile.
 LLM_MODEL_MIN_BYTES = 1_700_000_000
-LLM_CONTEXT_SIZE = 8192
-# Lasciamo circa 1800 token liberi per la risposta: il resto e' il tetto
-# massimo di trascrizione che possiamo inserire nel prompt.
-LLM_MAX_TRANSCRIPT_CHARS = 14000
+# Il contesto non e' piu' fisso: viene calcolato sulla lunghezza reale
+# del testo in ingresso (vedi summarization/llm.py). Ogni token di
+# contesto in piu' costa memoria per la cache delle chiavi e rallenta
+# tutto su un computer da ufficio, dove la memoria e' la vera strozzatura.
+LLM_CONTEXT_MIN = 1024
+LLM_CONTEXT_MAX = 4096
+# Su un computer da ufficio il tempo di generazione cresce quasi in
+# proporzione alla lunghezza del testo, sia in ingresso sia in uscita:
+# un report piu' asciutto e una trascrizione piu' compatta riducono
+# l'attesa da diversi minuti a poco piu' di uno, senza perdere le
+# informazioni che servono davvero al selezionatore.
+#
+# La trascrizione viene prima compattata (battute unite, intercalari
+# tolti): 4500 caratteri di testo compattato contengono piu' sostanza
+# di 7000 caratteri grezzi, e costano un terzo del tempo di lettura.
+LLM_MAX_TRANSCRIPT_CHARS = 4500
+# Il formato richiesto al modello sta in 300-380 token: con un tetto
+# generoso il modello riempie lo spazio disponibile con ripetizioni,
+# facendo aspettare l'utente per testo che non aggiunge nulla.
+LLM_MAX_TOKENS = 450
+LLM_BATCH_SIZE = 512
+
+
+def _physical_cores() -> int:
+    """
+    Numero di core FISICI, non di processori logici.
+
+    os.cpu_count() conta i thread hardware: su un portatile AMD a due
+    core con SMT restituisce 4. Dimensionare il calcolo su quel numero
+    significa lanciare piu' thread di quanti core esistano davvero, e su
+    carichi che saturano le unita' di calcolo (trascrizione e LLM sono
+    esattamente cosi') il risultato non e' piu' veloce: e' piu' lento,
+    perche' i thread si contendono la stessa unita' e la stessa cache.
+    """
+    try:
+        import psutil
+
+        physical = psutil.cpu_count(logical=False)
+        if physical:
+            return max(1, int(physical))
+    except Exception:
+        pass
+    logical = os.cpu_count() or 2
+    # Senza psutil ipotizziamo SMT attivo: sbagliare per difetto costa
+    # poco, sbagliare per eccesso dimezza le prestazioni.
+    return max(1, logical // 2) if logical > 2 else max(1, logical)
+
+
+def llm_threads() -> int:
+    cores = _physical_cores()
+    return cores if cores <= 2 else cores - 1
 
 # --------------------------------------------------------------------------
 # Audio
 # --------------------------------------------------------------------------
 AUDIO_SAMPLE_RATE = 16000  # richiesto da Whisper
-TRANSCRIBE_CHUNK_SECONDS = 5.0     # durata della finestra trascritta
-TRANSCRIBE_OVERLAP_SECONDS = 0.6   # sovrapposizione: evita parole troncate
-SILENCE_RMS_THRESHOLD = 0.004      # sotto questa soglia il blocco e' silenzio
+# Soglia di silenzio applicata al decimo di secondo piu' sonoro della
+# frase. Il rilevatore di voce ha gia' scartato i silenzi: questa e'
+# solo una rete di sicurezza, e va tenuta bassa. Con un valore alto un
+# microfono integrato a guadagno modesto vedeva sparire intere risposte
+# prima ancora di arrivare al riconoscimento vocale, senza che nulla lo
+# segnalasse all'utente.
+SILENCE_RMS_THRESHOLD = 0.0018
+
+# Il taglio dell'audio non avviene piu' a intervalli fissi ma sulle
+# pause del parlato: i parametri stanno in app/audio/vad.py. Queste
+# durate restano come riferimento per le finestre di confronto dell'eco.
+TRANSCRIBE_CHUNK_SECONDS = 5.0
+TRANSCRIBE_OVERLAP_SECONDS = 0.6
+
+# Suggerimento dato al riconoscimento vocale: orienta il modello sul
+# lessico di un colloquio di lavoro e migliora la punteggiatura.
+#
+# Va usato SOLO quando la lingua del colloquio e' l'italiano. Un
+# suggerimento italiano dato a un colloquio in inglese sposta il modello
+# verso la lingua sbagliata; e su frasi brevi o disturbate Whisper
+# tende a restituire il suggerimento stesso al posto di cio' che ha
+# sentito, riempiendo la trascrizione di righe inventate.
+TRANSCRIPTION_PROMPT = "Colloquio di lavoro tra un selezionatore e un candidato."
+TRANSCRIPTION_PROMPT_LANGUAGE = "it"
+
+# Quante frasi concordi servono per fissare la lingua del colloquio.
+#
+# Le prime battute di un colloquio sono le peggiori su cui decidere:
+# "Buongiorno", "Mi sente?", "Perfetto". Due voti bastavano a fissare
+# per sempre la lingua sbagliata e a rendere illeggibile tutto il
+# resto. Ora servono piu' voti, presi solo su frasi lunghe e sicure.
+LANGUAGE_LOCK_VOTES = 4
+LANGUAGE_VOTE_MIN_SECONDS = 2.0    # frasi troppo brevi non votano
+LANGUAGE_VOTE_MIN_WORDS = 5
+LANGUAGE_VOTE_MIN_PROBABILITY = 0.80
+LANGUAGE_LOCK_MARGIN = 2           # scarto minimo sulla seconda classificata
+LANGUAGE_UNLOCK_VOTES = 3          # frasi sicure e concordi per cambiare idea
+LANGUAGE_UNLOCK_PROBABILITY = 0.90
+
+
+def transcription_threads() -> int:
+    """
+    Thread da assegnare al riconoscimento vocale.
+
+    Su un computer con due core vanno usati entrambi, altrimenti la
+    trascrizione non sta al passo del parlato; da quattro core in su ne
+    lasciamo uno libero per l'interfaccia e per la cattura audio, che
+    devono restare reattive.
+    """
+    cores = _physical_cores()
+    return cores if cores <= 2 else cores - 1
 
 # Etichette interne dei due canali audio
 SPEAKER_RECRUITER = "recruiter"   # microfono locale: chi conduce il colloquio

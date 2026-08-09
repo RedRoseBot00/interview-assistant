@@ -135,10 +135,17 @@ def apply_cpu_compat(force_generic: bool | None = None) -> bool:
     if force_generic:
         # CTranslate2: usa l'implementazione generica, senza AVX/AVX2.
         os.environ["CT2_FORCE_CPU_ISA"] = "GENERIC"
-        # Evita che OpenMP saturi la CPU quando gia' emulata.
-        os.environ.setdefault("OMP_NUM_THREADS", str(max(1, (os.cpu_count() or 4) // 2)))
     else:
         os.environ.pop("CT2_FORCE_CPU_ISA", None)
+
+    # OMP_NUM_THREADS non va impostata qui. In passato la modalita'
+    # compatibilita' la fissava a meta' dei core: su un computer a due
+    # core diventava 1, e quel valore veniva ereditato anche dal
+    # processo che genera il report, dimezzandone la velocita'. Il
+    # numero di thread e' gia' deciso esplicitamente da chi fa il
+    # calcolo (cpu_threads per la trascrizione, n_threads per l'LLM):
+    # una variabile d'ambiente globale puo' solo contraddirli.
+    os.environ.pop("OMP_NUM_THREADS", None)
 
     # CTranslate2 e tokenizers producono log rumorosi su stderr che, in
     # una app senza console, finirebbero nel nulla o darebbero fastidio.

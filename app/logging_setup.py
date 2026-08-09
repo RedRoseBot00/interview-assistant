@@ -113,9 +113,23 @@ def _install_fault_handler() -> None:
     try:
         path = crash_file()
         path.parent.mkdir(parents=True, exist_ok=True)
+        # Il referto del crash precedente va conservato. La reazione
+        # naturale di chi vede sparire l'applicazione e' rilanciarla
+        # subito: aprendo il file in scrittura si distruggeva proprio la
+        # descrizione del guasto che serviva a capirlo.
+        try:
+            if path.exists() and path.stat().st_size > 0:
+                precedente = path.with_name(path.stem + ".precedente" + path.suffix)
+                precedente.unlink(missing_ok=True)
+                path.replace(precedente)
+        except Exception:
+            logging.getLogger(__name__).debug(
+                "Referto precedente non conservato", exc_info=True
+            )
         _fault_file = open(path, "w", encoding="utf-8")
         _fault_file.write(
-            "Questo file viene sovrascritto a ogni avvio.\n"
+            "Questo file riguarda l'esecuzione corrente; quello dell'avvio "
+            "precedente si chiama '...precedente.txt'.\n"
             "Se l'applicazione si chiude di colpo, qui sotto trovi il punto "
             "esatto in cui e' avvenuto il crash.\n\n"
         )

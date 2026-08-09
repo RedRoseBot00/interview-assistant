@@ -16,6 +16,20 @@ from app import config
 
 log = logging.getLogger(__name__)
 
+# Numero di revisione della taratura automatica. Quando lo alziamo, le
+# scelte che il programma aveva deciso da solo in passato (dimensione
+# del modello, esito del test del motore) vengono ricalcolate una volta
+# sola al primo avvio. Serve perche' un'installazione esistente si
+# porta dietro il valore salvato dalla versione precedente, e senza
+# questo meccanismo continuerebbe a usare per sempre una taratura che
+# nel frattempo abbiamo scoperto essere sbagliata.
+TUNING_REVISION = 3
+
+# Impostazioni scelte dal programma, non dall'utente: sono quelle che
+# il cambio di revisione azzera.
+_AUTO_TUNED = ("whisper_model_size", "engine_selftest", "engine_selftest_size")
+
+
 def _default_model_size() -> str:
     """
     Modello proposto alla prima installazione, in base al processore.
@@ -24,10 +38,13 @@ def _default_model_size() -> str:
     stare al passo del parlato e la trascrizione accumula ritardo fino
     a perdere pezzi: meglio partire da uno piu' rapido, l'utente potra'
     sempre alzarlo dalle impostazioni.
-    """
-    import os
 
-    return "base" if (os.cpu_count() or 2) <= 2 else "small"
+    Il conteggio va fatto sui core FISICI: un portatile a due core con
+    SMT ne dichiara quattro, e su quel numero il programma sceglieva
+    'small', che su quella macchina impiega tre o quattro volte il
+    tempo di 'base' senza guadagnare quasi nulla in precisione.
+    """
+    return "base" if config._physical_cores() <= 2 else "small"
 
 
 DEFAULTS: dict[str, Any] = {
@@ -57,7 +74,14 @@ DEFAULTS: dict[str, Any] = {
     "engine_selftest_size": "",  # modello su cui il test e' stato eseguito
     # Interfaccia
     "always_on_top": False,
+    # Uso interno: vedi TUNING_REVISION.
+    "tuning_revision": 0,
 }
+
+# Lingue offerte nell'interfaccia: un valore fuori da questo elenco non
+# comparirebbe nel menu a tendina, che mostrerebbe "Rilevamento
+# automatico" mentre il programma userebbe di nascosto un'altra lingua.
+_LANGUAGE_CHOICES = ("auto", "it", "en", "es", "fr", "de", "pt")
 
 # Valori ammessi per le impostazioni a scelta chiusa: un file
 # modificato a mano non deve poter mettere il programma in uno stato
@@ -67,6 +91,8 @@ _ALLOWED: dict[str, tuple] = {
     "cpu_mode": ("auto", "compatible", "fast"),
     "echo_mode": ("off", "auto", "cancel"),
     "engine_selftest": ("", "ok", "ok-compatible", "failed"),
+    "transcription_language": _LANGUAGE_CHOICES,
+    "report_language": _LANGUAGE_CHOICES,
 }
 
 _lock = threading.RLock()
@@ -81,6 +107,9 @@ def _valid(key: str, value: Any) -> bool:
     default = DEFAULTS.get(key)
     if isinstance(default, bool) and not isinstance(value, bool):
         return False
+    if isinstance(default, int) and not isinstance(default, bool):
+        if isinstance(value, bool) or not isinstance(value, int):
+            return False
     if isinstance(default, str) and not isinstance(value, str):
         return False
     allowed = _ALLOWED.get(key)
@@ -120,8 +149,31 @@ def load() -> dict[str, Any]:
                 stored = {}
             if isinstance(stored, dict):
                 for key in DEFAULTS:
-                    if key in stored and _valid(key, stored[key]):
+                    if key not in stored:
+                        continue
+                    if _valid(key, stored[key]):
                         data[key] = stored[key]
+                    else:
+                        log.warning(
+                            "Impostazione '%s' con valore non ammesso (%r): "
+                            "uso il predefinito %r",
+                            key, stored[key], DEFAULTS[key],
+                        )
+
+        # Taratura automatica obsoleta: la ricalcoliamo una volta sola.
+        if int(data.get("tuning_revision", 0) or 0) < TUNING_REVISION:
+            for key in _AUTO_TUNED:
+                data[key] = DEFAULTS[key]
+            data["tuning_revision"] = TUNING_REVISION
+            log.info(
+                "Taratura automatica aggiornata alla revisione %s: "
+                "modello di trascrizione riportato a '%s'",
+                TUNING_REVISION, data["whisper_model_size"],
+            )
+            _cache = data
+            _write(data)
+            return dict(data)
+
         _cache = data
         return dict(data)
 
@@ -142,6 +194,12 @@ def set_many(values: dict[str, Any]) -> None:
         for key, value in values.items():
             if key not in DEFAULTS:
                 log.debug("Impostazione sconosciuta ignorata: %s", key)
+                continue
+            # Senza questo controllo un valore fuori dominio finiva sul
+            # disco e veniva scartato al riavvio: l'utente vedeva
+            # l'impostazione "non ricordarsi", senza alcuna traccia.
+            if not _valid(key, value):
+                log.warning("Valore non ammesso per '%s': %r", key, value)
                 continue
             data[key] = value
         _cache = data
