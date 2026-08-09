@@ -34,10 +34,18 @@ WHISPER_REPOS = {
     "medium": "Systran/faster-whisper-medium",
 }
 
-# File che compongono un modello. Alcuni sono opzionali perche' variano
-# tra una versione e l'altra del repository.
+# File che compongono un modello di trascrizione.
 _WHISPER_FILES_REQUIRED = ("config.json", "model.bin", "tokenizer.json")
-_WHISPER_FILES_OPTIONAL = ("vocabulary.txt", "vocabulary.json", "preprocessor_config.json")
+
+# Il vocabolario e' indispensabile: senza, il motore di calcolo rifiuta
+# di caricare il modello con l'errore "Cannot load the vocabulary from
+# the model directory". Il nome del file cambia a seconda di quando il
+# modello e' stato pubblicato, quindi proviamo entrambe le varianti e
+# ne pretendiamo almeno una.
+_WHISPER_FILES_VOCABULARY = ("vocabulary.json", "vocabulary.txt")
+
+# Utili ma non indispensabili: se mancano, il modello funziona lo stesso.
+_WHISPER_FILES_EXTRA = ("preprocessor_config.json",)
 
 ProgressFn = Optional[Callable[[str, int, int], None]]
 
@@ -129,15 +137,25 @@ def whisper_model_dir(size: str) -> Path:
     return config.WHISPER_CACHE_DIR / f"faster-whisper-{size}"
 
 
+def _file_ok(path: Path) -> bool:
+    return path.exists() and path.stat().st_size > 0
+
+
 def whisper_model_present(size: str) -> bool:
+    """
+    Il modello e' completo e utilizzabile.
+
+    Il controllo comprende il vocabolario: un'installazione priva di
+    quel file supera un controllo superficiale ma poi fa fallire ogni
+    colloquio, ed e' quindi peggio di un modello assente, perche' non
+    verrebbe mai riparata da sola.
+    """
     directory = whisper_model_dir(size)
     if not directory.is_dir():
         return False
-    for name in _WHISPER_FILES_REQUIRED:
-        path = directory / name
-        if not path.exists() or path.stat().st_size == 0:
-            return False
-    return True
+    if not all(_file_ok(directory / name) for name in _WHISPER_FILES_REQUIRED):
+        return False
+    return any(_file_ok(directory / name) for name in _WHISPER_FILES_VOCABULARY)
 
 
 def download_whisper_model(size: str, on_progress: ProgressFn = None) -> Path:
@@ -148,21 +166,14 @@ def download_whisper_model(size: str, on_progress: ProgressFn = None) -> Path:
     target = whisper_model_dir(size)
     target.mkdir(parents=True, exist_ok=True)
 
-    # Prima misuriamo il totale, cosi' la barra di avanzamento e' veritiera.
-    plan: list[tuple[str, int]] = []
-    for name in _WHISPER_FILES_REQUIRED:
-        size_bytes = _remote_size(_hf_url(repo, name))
-        if size_bytes == FILE_ASSENTE:
-            raise DownloadError(
-                f"Il file '{name}' del modello di trascrizione non e' disponibile "
-                f"nel repository {repo}."
-            )
-        plan.append((name, max(0, size_bytes)))
-    for name in _WHISPER_FILES_OPTIONAL:
-        size_bytes = _remote_size(_hf_url(repo, name))
-        if size_bytes >= 0:
-            plan.append((name, size_bytes))
-
+    # Le dimensioni servono solo per rendere veritiera la barra di
+    # avanzamento. Se il server non le comunica, procediamo comunque:
+    # decidere di NON scaricare un file solo perche' non se ne conosce
+    # la dimensione significherebbe consegnare un modello incompleto.
+    plan: list[tuple[str, int]] = [
+        (name, max(0, _remote_size(_hf_url(repo, name))))
+        for name in _WHISPER_FILES_REQUIRED
+    ]
     total = sum(size for _, size in plan)
     done = 0
 
@@ -172,29 +183,59 @@ def download_whisper_model(size: str, on_progress: ProgressFn = None) -> Path:
         if on_progress:
             on_progress("trascrizione", done, total)
 
-    try:
-        for name, size_bytes in plan:
-            destination = target / name
-            # Un file gia' presente si considera valido solo se la sua
-            # dimensione coincide con quella dichiarata dal server:
-            # altrimenti e' il residuo di un download interrotto e va
-            # riscaricato, altrimenti resterebbe corrotto per sempre.
-            if destination.exists():
-                actual = destination.stat().st_size
-                if actual > 0 and (size_bytes == 0 or actual == size_bytes):
-                    _tick(size_bytes)   # conta nel totale: la barra deve arrivare al 100%
-                    continue
-                log.warning(
-                    "File '%s' incompleto (%d byte su %d): lo riscarico",
-                    name, actual, size_bytes,
-                )
-                destination.unlink(missing_ok=True)
+    def _fetch(name: str, expected: int = 0) -> bool:
+        """Scarica un file. Restituisce False se il server non ce l'ha."""
+        destination = target / name
+        if destination.exists():
+            actual = destination.stat().st_size
+            if actual > 0 and (expected == 0 or actual == expected):
+                _tick(expected)
+                return True
+            log.warning(
+                "File '%s' incompleto (%d byte su %d attesi): lo riscarico",
+                name, actual, expected,
+            )
+            destination.unlink(missing_ok=True)
+        try:
             _download_file(
                 _hf_url(repo, name),
                 destination,
                 on_chunk=_tick,
-                expected_size=size_bytes,
+                expected_size=expected,
             )
+            return True
+        except requests.HTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            if status == 404:
+                return False
+            raise
+
+    try:
+        for name, size_bytes in plan:
+            if not _fetch(name, size_bytes):
+                raise DownloadError(
+                    f"Il file '{name}' del modello di trascrizione non e' "
+                    f"disponibile nel repository {repo}."
+                )
+
+        # Vocabolario: proviamo le varianti finche' una risponde.
+        if not any(_file_ok(target / name) for name in _WHISPER_FILES_VOCABULARY):
+            for name in _WHISPER_FILES_VOCABULARY:
+                if _fetch(name):
+                    log.info("Vocabolario scaricato: %s", name)
+                    break
+            else:
+                raise DownloadError(
+                    "Il vocabolario del modello di trascrizione non e' stato "
+                    "trovato. Senza di esso il motore non puo' avviarsi."
+                )
+
+        for name in _WHISPER_FILES_EXTRA:
+            try:
+                _fetch(name)
+            except Exception:
+                log.debug("File accessorio '%s' non scaricato", name, exc_info=True)
+
     except requests.RequestException as exc:
         raise DownloadError(
             "Download del modello di trascrizione non riuscito: "
