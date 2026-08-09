@@ -233,6 +233,34 @@ def update_notes(
     _with_recovery(_operation)
 
 
+def update_details(
+    interview_id: int,
+    candidate_name: str,
+    role: str,
+    notes: str,
+    experience: str,
+    skills: str,
+) -> None:
+    """
+    Riallinea i dati della scheda candidato a quelli visibili a schermo.
+
+    Serve al salvataggio automatico: nome, posizione, note, esperienza e
+    competenze si possono correggere anche dopo la fine del colloquio, e
+    devono finire nell'archivio senza che l'utente debba fare nulla.
+    """
+    init_db()
+
+    def _operation() -> None:
+        with _connect() as conn:
+            conn.execute(
+                "UPDATE interviews SET candidate_name = ?, role = ?, notes = ?, "
+                "experience = ?, skills = ? WHERE id = ?",
+                (candidate_name, role, notes, experience, skills, interview_id),
+            )
+
+    _with_recovery(_operation)
+
+
 def list_interviews(limit: int = 500) -> list[Interview]:
     init_db()
 
