@@ -76,6 +76,10 @@ jobs:
           name: InterviewAssistant-v${{ steps.versione.outputs.numero }}-Setup
           path: build/Output/InterviewAssistantSetup.exe
           if-no-files-found: error
+          # Le build vecchie si cancellano da sole dopo qualche giorno:
+          # cosi' nell'elenco resta solo quella buona e non c'e' modo di
+          # scaricare per sbaglio una versione superata.
+          retention-days: 5
 
       - name: Carica i log in caso di problemi
         if: failure()
