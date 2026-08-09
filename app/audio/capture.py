@@ -76,6 +76,9 @@ MAX_BACKLOG_SECONDS = 25.0
 # memoria senza fine se il motore si ferma del tutto.
 QUEUE_HARD_LIMIT = 512
 PROGRESS_INTERVAL_SECONDS = 0.5  # frequenza degli avvisi di avanzamento
+# Ogni quanto si controlla che i dispositivi audio predefiniti siano
+# ancora quelli su cui stiamo registrando.
+DEVICE_WATCH_SECONDS = 4.0
 # Oltre questo numero di elementi in coda gli avvisi di avanzamento non
 # servono piu' a nulla e occuperebbero soltanto spazio.
 PROGRESS_QUEUE_LIMIT = 48
@@ -694,6 +697,7 @@ class AudioRecorder:
         self._readers: list[_SourceReader] = []
         self._catalog: Optional[DeviceCatalog] = None
         self._pa_lock = threading.Lock()
+        self._watcher: Optional[threading.Thread] = None
         # Avvio e arresto non possono sovrapporsi. Senza questo blocco,
         # chi chiudeva la finestra nei primi secondi di un colloquio
         # faceva chiamare terminate() su PortAudio mentre l'altro thread
@@ -810,6 +814,75 @@ class AudioRecorder:
                 "Chiudi i programmi che stanno usando il microfono e riprova."
             )
 
+        self._start_device_watch(catalog)
+
+    # ------------------------------------------------------------------
+    # Sorveglianza dei dispositivi durante la registrazione
+    # ------------------------------------------------------------------
+    def _start_device_watch(self, catalog: DeviceCatalog) -> None:
+        """
+        Controlla che i dispositivi predefiniti restino quelli in uso.
+
+        Windows cambia il dispositivo predefinito da solo quando si
+        collega un auricolare Bluetooth, si inserisce un jack o si
+        attacca un monitor con altoparlanti. La registrazione in corso
+        NON segue quel cambio: continua a leggere dal vecchio
+        dispositivo, che di colpo non riceve piu' nulla. Il colloquio
+        prosegue in perfetto silenzio e nessuno se ne accorge finche'
+        non si apre il report e lo si trova vuoto.
+
+        Non possiamo cambiare dispositivo a caldo senza interrompere e
+        risincronizzare i due canali, cosa che perderebbe comunque
+        dell'audio: la cosa piu' utile e' avvisare subito, mentre c'e'
+        ancora tempo per rimediare.
+        """
+        atteso: dict[str, str] = {}
+        for reader in self._readers:
+            atteso[reader.speaker] = reader.device.name
+
+        def _controlla() -> None:
+            gia_avvisati: set[str] = set()
+            while not self._stop.wait(DEVICE_WATCH_SECONDS):
+                try:
+                    with self._pa_lock:
+                        corrente = {
+                            config.SPEAKER_RECRUITER: catalog.default_microphone(),
+                            config.SPEAKER_CANDIDATE: catalog.default_loopback(),
+                        }
+                except Exception:
+                    log.debug("Controllo dei dispositivi non riuscito", exc_info=True)
+                    continue
+
+                for speaker, nome_atteso in atteso.items():
+                    if speaker in gia_avvisati:
+                        continue
+                    info = corrente.get(speaker)
+                    if info is None or info.name == nome_atteso:
+                        continue
+                    gia_avvisati.add(speaker)
+                    quale = (
+                        "il microfono"
+                        if speaker == config.SPEAKER_RECRUITER
+                        else "l'audio di sistema"
+                    )
+                    messaggio = (
+                        f"ATTENZIONE: {quale} predefinito di Windows e' cambiato "
+                        f"durante il colloquio (da '{nome_atteso}' a "
+                        f"'{info.name}'). La registrazione continua sul "
+                        "dispositivo di partenza: se non senti piu' nulla, "
+                        "ferma il colloquio e riavvialo per usare il nuovo "
+                        "dispositivo."
+                    )
+                    log.warning(messaggio)
+                    self.warnings.append(messaggio)
+                    if self._on_error:
+                        self._on_error(speaker, RuntimeError(messaggio))
+
+        self._watcher = threading.Thread(
+            target=_controlla, name="audio-watch", daemon=True
+        )
+        self._watcher.start()
+
     # ------------------------------------------------------------------
     def _handle_source_error(self, speaker: str, exc: Exception) -> None:
         self.warnings.append(f"Sorgente audio '{speaker}' interrotta: {exc}")
@@ -833,6 +906,16 @@ class AudioRecorder:
             return self._stop_locked(timeout)
 
     def _stop_locked(self, timeout: float) -> bool:
+        # La sorveglianza usa PortAudio: va fermata PRIMA di chiuderlo,
+        # altrimenti puo' interrogare dispositivi mentre l'istanza viene
+        # distrutta, e quello fa terminare il programma all'istante.
+        if self._watcher is not None:
+            self._watcher.join(timeout=DEVICE_WATCH_SECONDS + 2)
+            if self._watcher.is_alive():
+                log.error("Sorveglianza dei dispositivi ancora attiva")
+                return False
+            self._watcher = None
+
         # Ogni sorgente ha il proprio tempo di attesa. Con una scadenza
         # unica, una sorgente lenta consumava tutto il budget e la
         # seconda riceveva join(0): veniva dichiarata "ancora attiva"
