@@ -219,7 +219,7 @@ def context_size_for(prompt: str, system: str, max_tokens: int) -> int:
     lo scambio su disco: da li' in avanti non conta piu' nient'altro.
 
     La stima e' volutamente prudente (due caratteri per token contro i
-    tre e mezzo tipici dell'italiano): sbagliare per eccesso costa un
+    tre e mezzo tipici delle lingue latine): sbagliare per eccesso costa un
     po' di memoria, sbagliare per difetto farebbe fallire il report.
     """
     caratteri = len(prompt) + len(system)
