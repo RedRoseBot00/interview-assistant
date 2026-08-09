@@ -34,14 +34,37 @@ from app.audio.capture import AudioChunk, rms_level
 
 log = logging.getLogger(__name__)
 
-# Oltre questo intervallo fra due blocchi della stessa persona il
-# contesto precedente non serve piu' a togliere le ripetizioni: due
-# frasi identiche pronunciate a distanza sono due frasi diverse.
-CONTEXT_EXPIRY_SECONDS = config.TRANSCRIBE_CHUNK_SECONDS * 2.5
+# Quanto una frase del microfono puo' restare in attesa dell'audio di
+# riferimento prima di essere trascritta comunque. Ora che il canale del
+# candidato segnala anche i propri silenzi, l'attesa e' quasi sempre
+# nulla: questo valore serve solo come rete di sicurezza.
+REFERENCE_WAIT_SECONDS = 1.2
 
-# Quanto un blocco del microfono puo' restare in attesa dell'audio di
-# riferimento prima di essere trascritto comunque.
-REFERENCE_WAIT_SECONDS = 2.5
+# Accorpamento delle frasi vicine.
+#
+# Il riconoscimento vocale lavora sempre su una finestra di trenta
+# secondi, che riempie di silenzio quando l'audio e' piu' corto: il
+# costo di una chiamata e' quindi quasi lo stesso per una frase di
+# mezzo secondo e per una di otto. Unire le frasi gia' in attesa nella
+# coda riduce il numero di chiamate senza aggiungere alcun ritardo,
+# perche' si accorpa soltanto cio' che e' gia' arrivato.
+# La finestra di Whisper e' di trenta secondi: restando sotto i
+# ventisei si sfrutta quasi tutta la chiamata invece di sprecarne il
+# sessanta per cento in silenzio aggiunto. Accorpare non ritarda nulla,
+# perche' si uniscono solo frasi gia' presenti in coda.
+MERGE_GAP_SECONDS = 1.5
+MERGE_MAX_SECONDS = 26.0
+MERGE_LOOKAHEAD = 32
+
+# Quando la coda cresce, l'unica cosa che conta e' tornare al presente:
+# si accorpa fino al limite di durata ignorando la lunghezza delle
+# pause, dimezzando il numero di chiamate al riconoscimento vocale.
+BACKLOG_AGGRESSIVE_MERGE = 3
+BACKLOG_GAP_SECONDS = 6.0
+
+# Ogni quante frasi lunghe si lascia il modello libero di ridire la sua
+# sulla lingua, per potersi ricredere su un blocco iniziale sbagliato.
+LANGUAGE_PROBE_EVERY = 8
 
 # Finestra temporale entro cui due frasi uguali su canali diversi sono
 # considerate la stessa frase (eco), non due interventi distinti.
@@ -63,6 +86,64 @@ class TranscriptSegment:
             "language": self.language,
             "offset_seconds": round(self.offset_seconds, 2),
         }
+
+
+def _loudest_rms(samples: np.ndarray, window: int = 1600) -> float:
+    """
+    Livello del decimo di secondo piu' sonoro della frase.
+
+    La media sull'intera frase e' fuorviante, perche' comprende il
+    silenzio conservato prima e dopo il parlato per non troncare le
+    parole: una risposta breve ma nitida risulterebbe sotto soglia.
+    """
+    if samples.size == 0:
+        return 0.0
+    if samples.size <= window:
+        return rms_level(samples)
+    usable = (samples.size // window) * window
+    blocks = samples[:usable].reshape(-1, window).astype(np.float64)
+    return float(np.sqrt(np.max(np.mean(blocks * blocks, axis=1))))
+
+
+def _tame_peaks(samples: np.ndarray, ratio: float = 4.0) -> np.ndarray:
+    """
+    Ammorbidisce i picchi isolati molto piu' forti del parlato.
+
+    Whisper normalizza il proprio spettrogramma rispetto al valore
+    massimo del segmento e scarta tutto cio' che sta piu' di 80 dB sotto
+    di esso. Un clic del mouse, un colpo di tosse o una porta che sbatte
+    alzano quel massimo e schiacciano la voce verso il fondo della
+    dinamica: la frase risulta improvvisamente incomprensibile per un
+    motivo che non ha nulla a che vedere con chi parla.
+
+    La curva usata e' continua anche nella derivata, quindi non
+    introduce le armoniche stridule di un taglio netto.
+    """
+    if samples.size == 0:
+        return samples
+    livello = float(np.sqrt(np.mean(np.square(samples, dtype=np.float64))))
+    if livello <= 0.0:
+        return samples
+    limite = ratio * livello
+    modulo = np.abs(samples)
+    if float(modulo.max()) <= limite:
+        return samples
+    compresso = np.sign(samples) * limite * (2.0 - limite / np.maximum(modulo, 1e-9))
+    return np.where(modulo <= limite, samples, compresso).astype(np.float32)
+
+
+# Livello a cui portiamo le frasi troppo deboli prima del
+# riconoscimento: un microfono integrato a guadagno basso produce un
+# segnale che, pur essendo parlato nitido, resta vicino al fondo scala.
+TARGET_PEAK = 0.25
+MAX_GAIN = 8.0
+
+
+def _normalise_gain(samples: np.ndarray) -> np.ndarray:
+    picco = float(np.max(np.abs(samples))) if samples.size else 0.0
+    if picco <= 0.0 or picco >= TARGET_PEAK:
+        return samples
+    return (samples * min(MAX_GAIN, TARGET_PEAK / picco)).astype(np.float32)
 
 
 def _normalise(word: str) -> str:
@@ -124,22 +205,53 @@ class TranscriptionEngine:
         self._model = None
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
-        self._use_vad = True
+
+        # Lingua: si riconosce nei primi interventi e poi si fissa. Il
+        # riconoscimento automatico ripetuto a ogni frase costa tempo e,
+        # sulle frasi brevi, sbaglia spesso attribuendo parole italiane
+        # a un'altra lingua.
+        self._locked_language: Optional[str] = (
+            None if language == "auto" else language
+        )
+        # Quando la lingua e' stata scelta dall'utente non deve mai
+        # cambiare; quando l'abbiamo dedotta noi, invece, restiamo
+        # disposti a ricrederci.
+        self._language_forced = language != "auto"
+        self._language_votes: Counter[str] = Counter()
+        self._unlock_votes: Counter[str] = Counter()
+        self._probe_countdown = 0
+
+        # Rapporto fra durata dell'audio e tempo impiegato a trascriverlo.
+        self.realtime_factor = 0.0
+        self._speed_samples = 0
 
         self.segments: list[TranscriptSegment] = []
         self.backlog = 0
 
         self._languages: Counter[str] = Counter()
         self._last_text: dict[str, str] = {}
-        self._last_offset: dict[str, float] = {}
         self._lock = threading.Lock()
 
         # Gestione dell'eco
         self.echo = echo_module.EchoProcessor(echo_mode, config.AUDIO_SAMPLE_RATE)
         self._reference = echo_module.ReferenceBuffer(config.AUDIO_SAMPLE_RATE)
         self._waiting: deque[tuple[AudioChunk, float]] = deque()
+        self._local: deque[AudioChunk] = deque()
         self.echo_dropped = 0
         self.duplicates_dropped = 0
+        self.merged_utterances = 0
+
+        # Conteggi aggiornati man mano. Ricalcolarli ogni secondo
+        # scorrendo tutti i segmenti significava tenere il lock del
+        # motore e rifare quattro passate sul testo dal thread grafico,
+        # con l'interfaccia che si faceva sempre piu' pesante col
+        # passare dei minuti di colloquio.
+        self._stats = {
+            "questions": 0,
+            "recruiter_words": 0,
+            "candidate_words": 0,
+            "segments": 0,
+        }
 
     # ------------------------------------------------------------------
     def load_model(self) -> None:
@@ -160,6 +272,12 @@ class TranscriptionEngine:
             str(whisper_model_dir(self.model_size)),
             device="cpu",
             compute_type=config.WHISPER_COMPUTE_TYPE,
+            # Senza questa indicazione la libreria usa un solo thread e
+            # su un portatile la trascrizione resta indietro rispetto al
+            # parlato. Lasciamo un core libero solo se ce ne sono almeno
+            # quattro: su un computer con due core servono entrambi.
+            cpu_threads=config.transcription_threads(),
+            num_workers=1,
         )
         log.info(
             "Modello '%s' caricato in %.1f s",
@@ -232,16 +350,17 @@ class TranscriptionEngine:
 
         while True:
             try:
-                chunk = audio_queue.get(timeout=0.4)
+                chunk = self._next_chunk(audio_queue, timeout=0.4)
             except queue.Empty:
+                self.backlog = len(self._waiting) + len(self._local)
                 self._flush_waiting(force=self._stop.is_set())
                 if self._stop.is_set() and not self._waiting:
                     break
                 continue
 
-            self.backlog = audio_queue.qsize() + len(self._waiting)
+            self.backlog = audio_queue.qsize() + len(self._local) + len(self._waiting)
             try:
-                self._accept(chunk)
+                self._accept(self._merge_following(audio_queue, chunk))
             except Exception as exc:
                 log.exception("Errore durante l'elaborazione di un blocco")
                 if self.on_error:
@@ -265,10 +384,104 @@ class TranscriptionEngine:
             pass
 
     # ------------------------------------------------------------------
+    # Accorpamento delle frasi contigue
+    # ------------------------------------------------------------------
+    def _next_chunk(
+        self, audio_queue: "queue.Queue[AudioChunk]", timeout: float
+    ) -> AudioChunk:
+        if self._local:
+            return self._local.popleft()
+        return audio_queue.get(timeout=timeout)
+
+    def _fill_local(self, audio_queue: "queue.Queue[AudioChunk]") -> None:
+        try:
+            while len(self._local) < MERGE_LOOKAHEAD:
+                self._local.append(audio_queue.get_nowait())
+        except queue.Empty:
+            pass
+
+    def _merge_following(
+        self, audio_queue: "queue.Queue[AudioChunk]", chunk: AudioChunk
+    ) -> AudioChunk:
+        """
+        Unisce alla frase corrente quelle immediatamente successive dello
+        stesso interlocutore, se sono gia' in coda e molto ravvicinate.
+
+        Il silenzio fra una frase e l'altra viene reinserito: cosi' la
+        durata complessiva resta fedele al tempo reale e il confronto
+        con l'audio della videochiamata, usato per riconoscere l'eco,
+        continua a combaciare.
+        """
+        if chunk.samples.size == 0:
+            return chunk
+
+        self._fill_local(audio_queue)
+        if not self._local:
+            return chunk
+
+        rate = config.AUDIO_SAMPLE_RATE
+        parti = [chunk.samples]
+        fine = chunk.offset + chunk.samples.size / rate
+        uniti = 0
+
+        # In arretrato conta solo smaltire: si accorpa anche attraverso
+        # pause piu' lunghe, perche' una chiamata da venti secondi costa
+        # quanto quattro da cinque.
+        in_ritardo = (
+            len(self._local) + len(self._waiting) >= BACKLOG_AGGRESSIVE_MERGE
+        )
+        pausa_massima = BACKLOG_GAP_SECONDS if in_ritardo else MERGE_GAP_SECONDS
+
+        while self._local:
+            successiva = self._local[0]
+            if (
+                successiva.speaker != chunk.speaker
+                or successiva.samples.size == 0
+                or successiva.continues_previous
+            ):
+                break
+
+            pausa = successiva.offset - fine
+            durata_totale = (
+                successiva.offset + successiva.samples.size / rate - chunk.offset
+            )
+            if pausa < -0.05 or pausa > pausa_massima:
+                break
+            if durata_totale > MERGE_MAX_SECONDS:
+                break
+
+            self._local.popleft()
+            if pausa > 0:
+                parti.append(np.zeros(int(pausa * rate), dtype=np.float32))
+            parti.append(successiva.samples)
+            fine = successiva.offset + successiva.samples.size / rate
+            uniti += 1
+
+        if not uniti:
+            return chunk
+
+        self.merged_utterances += uniti
+        return AudioChunk(
+            chunk.speaker,
+            np.concatenate(parti),
+            chunk.offset,
+            chunk.wall_time,
+            chunk.continues_previous,
+        )
+
+    # ------------------------------------------------------------------
     # Smistamento dei blocchi
     # ------------------------------------------------------------------
     def _accept(self, chunk: AudioChunk) -> None:
         if chunk.speaker == config.SPEAKER_CANDIDATE:
+            # Blocco vuoto: non e' audio, e' l'avviso che il canale del
+            # candidato e' stato analizzato fino a quell'istante e taceva.
+            if chunk.samples.size == 0:
+                if self.echo.enabled:
+                    self._reference.note_silence(chunk.offset)
+                    self._flush_waiting()
+                return
+
             # L'audio della videochiamata e' anche il riferimento con cui
             # riconoscere l'eco nel microfono.
             if self.echo.enabled:
@@ -291,7 +504,10 @@ class TranscriptionEngine:
         while self._waiting:
             chunk, arrived = self._waiting[0]
             duration = chunk.samples.size / config.AUDIO_SAMPLE_RATE
-            needed = chunk.offset + duration + echo_module.MAX_DELAY_SECONDS
+            # Serve il riferimento fino a poco oltre la fine della frase:
+            # il ritardo dell'eco sposta indietro il riferimento, non in
+            # avanti, quindi non occorre attendere altri mezzi secondi.
+            needed = chunk.offset + duration + echo_module.FORWARD_MARGIN_SECONDS
             waited = time.monotonic() - arrived
 
             if not force and not self._reference.covers(needed) and waited < REFERENCE_WAIT_SECONDS:
@@ -316,7 +532,15 @@ class TranscriptionEngine:
                     continue
                 samples = result.samples
 
-            self._transcribe(AudioChunk(chunk.speaker, samples, chunk.offset, chunk.wall_time))
+            self._transcribe(
+                AudioChunk(
+                    chunk.speaker,
+                    samples,
+                    chunk.offset,
+                    chunk.wall_time,
+                    chunk.continues_previous,
+                )
+            )
 
     # ------------------------------------------------------------------
     # Trascrizione vera e propria
@@ -325,51 +549,79 @@ class TranscriptionEngine:
         if chunk.samples.size == 0 or self._model is None:
             return
 
-        # Il silenzio costituisce gran parte di un colloquio: scartarlo
-        # subito risparmia CPU e riduce le "allucinazioni" del modello,
-        # che sull'audio muto tende a inventare frasi.
-        if rms_level(chunk.samples) < config.SILENCE_RMS_THRESHOLD:
+        # Ultimo controllo prima di impegnare il processore. Si misura il
+        # tratto piu' sonoro e non la media: ogni frase porta con se' un
+        # po' di silenzio all'inizio e alla fine, e la media abbasserebbe
+        # sotto soglia anche un "si'" pronunciato chiaramente.
+        if _loudest_rms(chunk.samples) < config.SILENCE_RMS_THRESHOLD:
             return
 
-        audio = np.asarray(chunk.samples, dtype=np.float32)
-        language = None if self.language == "auto" else self.language
+        audio = _normalise_gain(_tame_peaks(np.asarray(chunk.samples, dtype=np.float32)))
+        duration = audio.size / config.AUDIO_SAMPLE_RATE
 
-        try:
-            segments, info = self._model.transcribe(
-                audio,
-                language=language,
-                beam_size=1,
-                vad_filter=self._use_vad,
-                condition_on_previous_text=False,
-            )
-            parts = [seg.text.strip() for seg in segments]
-        except Exception as exc:
-            # Il filtro di rilevamento voce richiede una libreria
-            # aggiuntiva: se manca, proseguiamo senza, invece di
-            # interrompere un colloquio in corso.
-            if not self._use_vad:
-                raise
-            log.warning("Filtro voce non disponibile, proseguo senza: %s", exc)
-            self._use_vad = False
-            segments, info = self._model.transcribe(
-                audio,
-                language=language,
-                beam_size=1,
-                vad_filter=False,
-                condition_on_previous_text=False,
-            )
-            parts = [seg.text.strip() for seg in segments]
+        # Ogni tanto lasciamo che il modello ridica la sua sulla lingua:
+        # se il colloquio prosegue davvero in un'altra lingua dobbiamo
+        # accorgercene, invece di insistere per un'ora su quella
+        # riconosciuta male nelle prime due battute.
+        sonda = self._should_probe_language(duration)
+        lingua_chiamata = None if sonda else self._locked_language
+
+        started = time.monotonic()
+        segments, info = self._model.transcribe(
+            audio,
+            language=lingua_chiamata,
+            # Ricerca greedy: su un processore da portatile una ricerca
+            # piu' ampia costa il triplo del tempo e migliora pochissimo
+            # il parlato spontaneo.
+            beam_size=1,
+            best_of=1,
+            temperature=0.0,
+            # Il silenzio l'abbiamo gia' tolto noi con il rilevatore di
+            # voce: rifarlo qui costerebbe tempo per nulla.
+            vad_filter=False,
+            # Ogni frase e' indipendente: incatenarle fa propagare gli
+            # errori di riconoscimento da una frase alla successiva.
+            condition_on_previous_text=False,
+            # Difese contro le frasi inventate sul rumore di fondo.
+            no_speech_threshold=0.6,
+            compression_ratio_threshold=2.4,
+            log_prob_threshold=-1.0,
+            # I marcatori temporali non vengono usati da nessuna parte
+            # in questo programma: farli produrre al decoder costa token
+            # a ogni frase ed e' una fonte nota di righe inventate sul
+            # rumore, dove il modello entra in un ciclo di soli tempi.
+            without_timestamps=True,
+            initial_prompt=self._prompt_for_call(lingua_chiamata),
+        )
+        parts = [seg.text.strip() for seg in segments]
+
+        elapsed = time.monotonic() - started
+        self._record_speed(duration, elapsed)
 
         text = " ".join(part for part in parts if part).strip()
         if not text:
             return
 
         detected = getattr(info, "language", "") or ""
+        self._consider_language(
+            detected,
+            float(getattr(info, "language_probability", 0.0) or 0.0),
+            duration,
+            len(text.split()),
+            probe=sonda,
+        )
 
         with self._lock:
-            previous = self._last_text.get(chunk.speaker, "")
-            if chunk.offset - self._last_offset.get(chunk.speaker, -999.0) > CONTEXT_EXPIRY_SECONDS:
-                previous = ""
+            # La ripetizione di parole esiste solo quando una frase e'
+            # stata troncata per durata massima e prosegue nella
+            # successiva. Fuori da quel caso, due frasi sono separate da
+            # una pausa reale e una parola ripetuta e' voluta: toglierla
+            # cancellerebbe testo legittimo.
+            previous = (
+                self._last_text.get(chunk.speaker, "")
+                if chunk.continues_previous
+                else ""
+            )
             text = _strip_overlap(previous, text)
             if not text:
                 return
@@ -385,9 +637,18 @@ class TranscriptionEngine:
                     return
 
             self._last_text[chunk.speaker] = text
-            self._last_offset[chunk.speaker] = chunk.offset
+
             if detected:
                 self._languages[detected] += 1
+
+            parole = len(text.split())
+            self._stats["segments"] += 1
+            if chunk.speaker == config.SPEAKER_RECRUITER:
+                self._stats["recruiter_words"] += parole
+                if "?" in text:
+                    self._stats["questions"] += 1
+            else:
+                self._stats["candidate_words"] += parole
 
             segment = TranscriptSegment(
                 speaker=chunk.speaker,
@@ -400,6 +661,112 @@ class TranscriptionEngine:
 
         if self.on_segment:
             self.on_segment(segment)
+
+    # ------------------------------------------------------------------
+    def _prompt_for_call(self, language: Optional[str]) -> Optional[str]:
+        """
+        Il suggerimento di contesto va dato solo nella sua lingua.
+
+        Passarlo sempre significava spingere verso l'italiano anche un
+        colloquio in inglese, e — su frasi brevi o disturbate — indurre
+        il modello a restituire il suggerimento stesso al posto di cio'
+        che aveva sentito, riempiendo la trascrizione di righe che
+        nessuno aveva pronunciato.
+        """
+        if language != config.TRANSCRIPTION_PROMPT_LANGUAGE:
+            return None
+        return config.TRANSCRIPTION_PROMPT
+
+    def _should_probe_language(self, duration: float) -> bool:
+        """Vero quando conviene rifare il riconoscimento della lingua."""
+        if self._locked_language is None or self._language_forced:
+            return False
+        if duration < config.LANGUAGE_VOTE_MIN_SECONDS:
+            return False
+        if self._probe_countdown > 0:
+            self._probe_countdown -= 1
+            return False
+        self._probe_countdown = LANGUAGE_PROBE_EVERY
+        return True
+
+    def _vote_is_trustworthy(
+        self, detected: str, probability: float, duration: float, words: int
+    ) -> bool:
+        """
+        Una frase puo' decidere la lingua solo se e' lunga e sicura.
+
+        Le prime battute di un colloquio sono "Buongiorno", "Mi sente?",
+        "Perfetto": proprio quelle su cui il riconoscimento sbaglia piu'
+        spesso. Bastavano due errori concordi per fissare la lingua
+        sbagliata e rendere illeggibile tutto il resto del colloquio.
+        """
+        return bool(
+            detected
+            and duration >= config.LANGUAGE_VOTE_MIN_SECONDS
+            and words >= config.LANGUAGE_VOTE_MIN_WORDS
+            and probability >= config.LANGUAGE_VOTE_MIN_PROBABILITY
+        )
+
+    def _consider_language(
+        self,
+        detected: str,
+        probability: float,
+        duration: float,
+        words: int,
+        probe: bool = False,
+    ) -> None:
+        if self._language_forced or not detected:
+            return
+        if not self._vote_is_trustworthy(detected, probability, duration, words):
+            return
+
+        if self._locked_language is None:
+            self._language_votes[detected] += 1
+            classifica = self._language_votes.most_common(2)
+            lingua, voti = classifica[0]
+            seconda = classifica[1][1] if len(classifica) > 1 else 0
+            if (
+                voti >= config.LANGUAGE_LOCK_VOTES
+                and voti - seconda >= config.LANGUAGE_LOCK_MARGIN
+            ):
+                self._locked_language = lingua
+                log.info("Lingua del colloquio fissata su '%s'", lingua)
+                self._notify_status(f"Lingua riconosciuta: {lingua}")
+            return
+
+        # Lingua gia' fissata: il verdetto vale solo se e' arrivato da
+        # una sonda, cioe' da una chiamata in cui il modello era libero
+        # di scegliere. Altrimenti ci confermerebbe soltanto la lingua
+        # che gli abbiamo imposto noi.
+        if not probe:
+            return
+        if detected == self._locked_language:
+            self._unlock_votes.clear()
+            return
+        if probability < config.LANGUAGE_UNLOCK_PROBABILITY:
+            return
+
+        self._unlock_votes[detected] += 1
+        if self._unlock_votes[detected] >= config.LANGUAGE_UNLOCK_VOTES:
+            precedente = self._locked_language
+            self._locked_language = detected
+            self._unlock_votes.clear()
+            self._language_votes.clear()
+            self._language_votes[detected] = config.LANGUAGE_LOCK_VOTES
+            log.info("Lingua del colloquio corretta da '%s' a '%s'", precedente, detected)
+            self._notify_status(f"Lingua riconosciuta: {detected}")
+
+    def _record_speed(self, audio_seconds: float, elapsed: float) -> None:
+        if audio_seconds <= 0 or elapsed <= 0:
+            return
+        factor = audio_seconds / elapsed
+        # Media mobile: un singolo intervento anomalo non deve far
+        # sembrare il programma piu' lento o piu' veloce di quanto sia.
+        if self._speed_samples == 0:
+            self.realtime_factor = factor
+        else:
+            self.realtime_factor = 0.8 * self.realtime_factor + 0.2 * factor
+        self._speed_samples += 1
 
     def _is_echo_of_candidate(self, text: str, offset: float) -> bool:
         """Da chiamare tenendo il lock."""
@@ -443,3 +810,22 @@ class TranscriptionEngine:
     def segments_as_dicts(self) -> list[dict]:
         with self._lock:
             return [s.to_dict() for s in self.segments]
+
+    def statistics(self) -> dict:
+        """
+        Numeri mostrati accanto alle note, aggiornati man mano.
+
+        Vengono letti una volta al secondo dal thread grafico: e' quindi
+        essenziale che il costo non cresca con la durata del colloquio.
+        """
+        with self._lock:
+            recruiter = self._stats["recruiter_words"]
+            candidate = self._stats["candidate_words"]
+            totale = recruiter + candidate
+            return {
+                "questions": self._stats["questions"],
+                "recruiter_words": recruiter,
+                "candidate_words": candidate,
+                "candidate_share": round(100 * candidate / totale) if totale else 0,
+                "segments": self._stats["segments"],
+            }
