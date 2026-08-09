@@ -27,6 +27,13 @@ TUNING_REVISION = 3
 
 # Impostazioni scelte dal programma, non dall'utente: sono quelle che
 # il cambio di revisione azzera.
+#
+# whisper_model_size sta in questo elenco ma e' un caso speciale: e'
+# scritto sia dalla taratura automatica sia dalla scheda Impostazioni.
+# Azzerandolo senza distinguere, a chi aveva scelto "medium" a mano il
+# programma lo riportava a "base" al primo avvio dopo un aggiornamento,
+# in silenzio. Per questo teniamo traccia delle scelte esplicite in
+# "user_choices" e quelle non si toccano.
 _AUTO_TUNED = ("whisper_model_size", "engine_selftest", "engine_selftest_size")
 
 
@@ -76,6 +83,9 @@ DEFAULTS: dict[str, Any] = {
     "always_on_top": False,
     # Uso interno: vedi TUNING_REVISION.
     "tuning_revision": 0,
+    # Impostazioni che l'utente ha cambiato di persona dalla scheda
+    # Impostazioni: non vanno mai sovrascritte da una taratura automatica.
+    "user_choices": [],
 }
 
 # Lingue offerte nell'interfaccia: un valore fuori da questo elenco non
@@ -105,6 +115,8 @@ def _path():
 
 def _valid(key: str, value: Any) -> bool:
     default = DEFAULTS.get(key)
+    if isinstance(default, list):
+        return isinstance(value, list) and all(isinstance(v, str) for v in value)
     if isinstance(default, bool) and not isinstance(value, bool):
         return False
     if isinstance(default, int) and not isinstance(default, bool):
@@ -160,10 +172,21 @@ def load() -> dict[str, Any]:
                             key, stored[key], DEFAULTS[key],
                         )
 
-        # Taratura automatica obsoleta: la ricalcoliamo una volta sola.
+        # Taratura automatica obsoleta: la ricalcoliamo una volta sola,
+        # rispettando pero' cio' che l'utente ha scelto di persona.
         if int(data.get("tuning_revision", 0) or 0) < TUNING_REVISION:
+            # Attenzione: questo modulo definisce una funzione set(), che
+            # oscura il tipo predefinito di Python. Qui si usa una lista.
+            scelte = list(data.get("user_choices") or ())
             for key in _AUTO_TUNED:
+                if key in scelte:
+                    log.info("Scelta dell'utente su '%s' conservata", key)
+                    continue
                 data[key] = DEFAULTS[key]
+            # L'esito del test va comunque rifatto: se il modello e'
+            # cambiato, il test precedente non dice piu' nulla.
+            data["engine_selftest"] = DEFAULTS["engine_selftest"]
+            data["engine_selftest_size"] = DEFAULTS["engine_selftest_size"]
             data["tuning_revision"] = TUNING_REVISION
             log.info(
                 "Taratura automatica aggiornata alla revisione %s: "
@@ -182,7 +205,14 @@ def get(key: str, default: Any = None) -> Any:
     return load().get(key, DEFAULTS.get(key, default))
 
 
-def set_many(values: dict[str, Any]) -> None:
+def set_many(values: dict[str, Any], explicit: bool = False) -> None:
+    """
+    Salva piu' impostazioni insieme.
+
+    explicit=True va usato SOLO quando e' l'utente a premere "Salva"
+    nella scheda Impostazioni: quelle chiavi vengono marcate come scelte
+    consapevoli e nessuna taratura automatica potra' piu' toccarle.
+    """
     global _cache
     # Il caricamento va fatto prima di acquisire il lock in scrittura:
     # senza questa riga, una scrittura eseguita prima di qualunque
@@ -191,6 +221,12 @@ def set_many(values: dict[str, Any]) -> None:
     load()
     with _lock:
         data = dict(_cache or DEFAULTS)
+        if explicit:
+            scelte = list(data.get("user_choices") or ())
+            for chiave in values:
+                if chiave in _AUTO_TUNED and chiave not in scelte:
+                    scelte.append(chiave)
+            data["user_choices"] = sorted(scelte)
         for key, value in values.items():
             if key not in DEFAULTS:
                 log.debug("Impostazione sconosciuta ignorata: %s", key)

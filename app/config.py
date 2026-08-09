@@ -11,7 +11,7 @@ from pathlib import Path
 
 APP_NAME = "InterviewAssistant"
 APP_DISPLAY_NAME = "Interview Assistant"
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.0.1"
 
 # --------------------------------------------------------------------------
 # Percorsi applicazione
@@ -119,6 +119,10 @@ LLM_MAX_TRANSCRIPT_CHARS = 4500
 # generoso il modello riempie lo spazio disponibile con ripetizioni,
 # facendo aspettare l'utente per testo che non aggiunge nulla.
 LLM_MAX_TOKENS = 450
+# Da non alzare sopra 512 senza prima verificarlo: la versione di
+# llama-cpp-python che usiamo non espone n_ubatch, che resta fisso a
+# 512. Con n_batch piu' grande i due valori divergono e la lettura del
+# prompt peggiora invece di migliorare.
 LLM_BATCH_SIZE = 512
 
 

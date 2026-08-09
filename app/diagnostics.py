@@ -19,9 +19,13 @@ import logging
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
+from typing import Callable, Optional
 
 from app import compat, settings
+
+StopFn = Optional[Callable[[], bool]]
 
 log = logging.getLogger(__name__)
 
@@ -85,7 +89,9 @@ def _child_command(mode: str) -> list[str]:
     return [sys.executable, entry, "--self-test", mode]
 
 
-def _run_child(force_generic: bool, whisper_size: str) -> tuple[int, str]:
+def _run_child(
+    force_generic: bool, whisper_size: str, should_stop: StopFn = None
+) -> tuple[int, str]:
     env = dict(os.environ)
     if force_generic:
         env["CT2_FORCE_CPU_ISA"] = "GENERIC"
@@ -98,29 +104,50 @@ def _run_child(force_generic: bool, whisper_size: str) -> tuple[int, str]:
         # Evita che compaia una finestra nera del prompt dei comandi.
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
+    # Il test dura fino a tre minuti, e va ripetuto due volte. Con una
+    # attesa non interrompibile, chi chiudeva la finestra durante il
+    # primo avvio restava bloccato per tutto quel tempo; il programma
+    # arrivava a uccidere il proprio thread, e uccidere un thread Python
+    # mentre tiene il blocco globale lascia la finestra a schermo per
+    # sempre. Qui invece si controlla ogni decimo di secondo.
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             _child_command("transcription"),
             env=env,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
             # Senza errors="replace", un output non decodificabile con la
             # codifica locale di Windows farebbe perdere proprio il
             # messaggio diagnostico che stiamo cercando.
             errors="replace",
-            timeout=SELFTEST_TIMEOUT_SECONDS,
             creationflags=creationflags,
         )
-    except subprocess.TimeoutExpired:
-        return -99, "Il test di avvio non si e' concluso entro il tempo massimo."
     except Exception as exc:  # pragma: no cover
         return -98, f"Impossibile eseguire il test di avvio: {exc}"
 
-    output = (proc.stdout or "") + (proc.stderr or "")
-    return proc.returncode, output.strip()
+    scadenza = time.monotonic() + SELFTEST_TIMEOUT_SECONDS
+    while proc.poll() is None:
+        if should_stop is not None and should_stop():
+            proc.kill()
+            proc.communicate(timeout=10)
+            return -97, "Test di avvio interrotto su richiesta."
+        if time.monotonic() > scadenza:
+            proc.kill()
+            proc.communicate(timeout=10)
+            return -99, "Il test di avvio non si e' concluso entro il tempo massimo."
+        time.sleep(0.1)
+
+    try:
+        output, _ = proc.communicate(timeout=15)
+    except Exception:
+        output = ""
+    return proc.returncode, (output or "").strip()
 
 
-def run_transcription_selftest(whisper_size: str) -> SelfTestResult:
+def run_transcription_selftest(
+    whisper_size: str, should_stop: StopFn = None
+) -> SelfTestResult:
     """
     Prova a caricare il motore di trascrizione, prima in modalita'
     veloce e — se il processo figlio muore — in modalita' compatibilita'.
@@ -143,11 +170,13 @@ def run_transcription_selftest(whisper_size: str) -> SelfTestResult:
             "Test di avvio del motore di trascrizione (compatibilita'=%s)",
             force_generic,
         )
-        code, detail = _run_child(force_generic, whisper_size)
+        code, detail = _run_child(force_generic, whisper_size, should_stop)
         last_detail = detail
         if code == 0:
             log.info("Test superato (compatibilita'=%s)", force_generic)
             return SelfTestResult(True, force_generic, detail)
+        if code == -97:
+            return SelfTestResult(False, False, detail)
         log.warning("Test fallito con codice %s: %s", code, detail[:2000])
 
         # Il ripiego sui kernel generici ha senso solo se il processo
