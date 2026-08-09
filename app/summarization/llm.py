@@ -27,6 +27,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -100,12 +101,17 @@ _TRUNCATION_MARKER = (
     "\n\n[...parte centrale del colloquio omessa per limiti di lunghezza...]\n\n"
 )
 
-# Intercalari che da soli non aggiungono nulla a un resoconto. Vengono
-# tolti solo quando costituiscono l'intera battuta.
+# Intercalari privi di contenuto.
+#
+# L'elenco NON contiene le risposte: "si'", "no", "certo", "esatto".
+# Sembrano rumore, ma in un colloquio sono la risposta a una domanda
+# chiusa — "ha gia' gestito un team?" / "No." — e toglierle significa
+# consegnare al modello un colloquio in cui il candidato non ha mai
+# risposto, chiedendogli poi di valutarlo.
 _INTERCALARI = {
-    "si", "sì", "no", "ok", "okay", "certo", "esatto", "perfetto", "bene",
-    "mmm", "mhm", "ah", "eh", "beh", "allora", "ecco", "va bene", "d'accordo",
-    "yes", "yeah", "no", "right", "okay", "sure", "exactly", "perfect",
+    "mmm", "mhm", "uhm", "ah", "eh", "beh", "boh", "ecco", "allora",
+    "ok", "okay", "perfetto", "bene", "benissimo", "va bene",
+    "right", "okay", "alright", "well", "so", "uh", "um",
 }
 
 
@@ -138,11 +144,18 @@ def compact_transcript(transcript: str) -> str:
         if not testo:
             continue
 
+        stesso = bool(unite) and unite[-1][0] == etichetta
         nudo = testo.lower().strip(".,;:!? ")
-        if len(testo.split()) <= 2 and nudo in _INTERCALARI:
+        # Un intercalare si scarta SOLO se chi lo pronuncia e' la stessa
+        # persona della battuta precedente: in quel caso sarebbe stato
+        # comunque fuso con essa e non aggiunge nulla. Se invece cambia
+        # interlocutore, quella battuta e' un turno di parola — cioe'
+        # una risposta — e va conservata, altrimenti sparisce anche la
+        # traccia che una domanda abbia mai ricevuto risposta.
+        if stesso and len(testo.split()) <= 2 and nudo in _INTERCALARI:
             continue
 
-        if unite and unite[-1][0] == etichetta:
+        if stesso:
             unite[-1][1].append(testo)
         else:
             unite.append((etichetta, [testo]))
@@ -389,11 +402,22 @@ def _child_command(input_path: Path, output_path: Path) -> list[str]:
 # a occupare tutti i core del computer per minuti, invisibile.
 _active_child: subprocess.Popen | None = None
 _child_lock = threading.Lock()
+# Annullamento richiesto prima che il processo figlio esista.
+#
+# Fra la richiesta di un report e l'avvio effettivo di llama.cpp passano
+# diversi secondi: si compatta la trascrizione, si costruisce il testo,
+# si prepara la cartella temporanea. Chi chiudeva la finestra in quella
+# finestra di tempo non interrompeva nulla — il figlio non era ancora
+# nato — e il calcolo partiva DOPO l'annullamento, restando poi a
+# occupare tutti i core per minuti, invisibile.
+_cancel_requested = False
 
 
 def cancel_running_generation() -> None:
     """Interrompe la generazione del report, se ne e' in corso una."""
+    global _cancel_requested
     with _child_lock:
+        _cancel_requested = True
         proc = _active_child
     if proc is not None and proc.poll() is None:
         try:
@@ -413,7 +437,10 @@ def _read_stream(
     all'interfaccia, cosi' il report compare parola per parola invece di
     apparire tutto insieme alla fine.
     """
-    raccolto: list[str] = []
+    # Coda a lunghezza fissa: solo le ultime righe servono a diagnosticare
+    # un errore, e una libreria loquace non deve poter far crescere la
+    # memoria del programma per tutta la generazione.
+    raccolto: "deque[str]" = deque(maxlen=40)
     try:
         if proc.stdout is None:
             return ""
@@ -441,7 +468,43 @@ def _read_stream(
                 proc.stdout.close()
         except Exception:
             pass
-    return "\n".join(raccolto[-40:])
+    return "\n".join(raccolto)
+
+
+class DownloadCancelledReport(Exception):
+    """L'utente ha annullato prima che il calcolo cominciasse."""
+
+
+# Codici con cui Windows segnala che e' stato il sistema a fermare il
+# processo: solo questi indicano davvero un'incompatibilita' con il
+# processore. Prima veniva dato quel messaggio per QUALUNQUE errore.
+_USCITE_NATIVE = {0xC000001D, 0xC0000005, 0xC0000096, 0xC00000FD}
+
+
+def _spiega_uscita(codice: int, dettaglio: str) -> str:
+    """Motivo comprensibile del fallimento, ricavato da cio' che e' successo."""
+    testo = (dettaglio or "").lower()
+    if (codice & 0xFFFFFFFF) in _USCITE_NATIVE or codice in (-4, -11):
+        return (
+            "il modello linguistico non e' compatibile con questo processore "
+            "oppure la memoria disponibile non e' sufficiente."
+        )
+    if "memoryerror" in testo or "cannot allocate" in testo or "bad_alloc" in testo:
+        return (
+            "la memoria del computer non e' bastata per caricare il modello: "
+            "chiudi gli altri programmi e riprova."
+        )
+    if "no such file" in testo or "filenotfound" in testo:
+        return "il file del modello per i report non e' stato trovato."
+    if "failed to load model" in testo or "gguf" in testo:
+        return (
+            "il file del modello per i report risulta danneggiato: eliminalo "
+            "dalla cartella dei modelli e riavvia per riscaricarlo."
+        )
+    ultima = [r for r in (dettaglio or "").strip().splitlines() if r.strip()]
+    if ultima:
+        return f"il generatore si e' interrotto ({ultima[-1].strip()[:160]})."
+    return f"il generatore si e' interrotto senza spiegazioni (codice {codice})."
 
 
 def _safe_fallback(
@@ -486,6 +549,10 @@ def generate_report(
     Produce il report. Non solleva eccezioni: in caso di problemi
     restituisce il resoconto di riserva con una nota esplicativa.
     """
+    global _cancel_requested
+    with _child_lock:
+        _cancel_requested = False
+
     language_code = (
         detected_language if report_language == "auto" else report_language
     ) or "it"
@@ -541,22 +608,31 @@ def generate_report(
         ambiente = dict(os.environ)
         ambiente.pop("OMP_NUM_THREADS", None)
 
+        # Gli errori del figlio vanno su file, non nel nulla. Con
+        # stderr=DEVNULL qualunque uscita diversa da zero — anche una
+        # normale eccezione Python, un file GGUF corrotto, un percorso
+        # sbagliato — produceva sempre lo stesso messaggio inventato
+        # ("il modello non e' compatibile con questo processore"), che
+        # nella maggior parte dei casi era falso e mandava fuori strada.
+        error_path = tmp_dir / "errori.txt"
+
         global _active_child
-        proc = subprocess.Popen(
-            _child_command(input_path, output_path),
-            stdout=subprocess.PIPE,
-            # Gli errori del processo figlio finiscono nel file di log
-            # condiviso: leggere due flussi contemporaneamente rischia di
-            # bloccarsi quando uno dei due si riempie.
-            stderr=subprocess.DEVNULL,
-            text=True,
-            # Senza errors="replace" un carattere non decodificabile
-            # interromperebbe la lettura a meta' generazione.
-            errors="replace",
-            env=ambiente,
-            creationflags=creationflags,
-        )
         with _child_lock:
+            if _cancel_requested:
+                raise DownloadCancelledReport()
+            with open(error_path, "w", encoding="utf-8") as errori:
+                proc = subprocess.Popen(
+                    _child_command(input_path, output_path),
+                    stdout=subprocess.PIPE,
+                    stderr=errori,
+                    text=True,
+                    # Senza errors="replace" un carattere non
+                    # decodificabile interromperebbe la lettura a meta'
+                    # generazione.
+                    errors="replace",
+                    env=ambiente,
+                    creationflags=creationflags,
+                )
             _active_child = proc
 
         child_out = ""
@@ -588,7 +664,6 @@ def generate_report(
             with _child_lock:
                 _active_child = None
 
-        child_err = ""
         if proc.returncode == 0 and output_path.exists():
             data = json.loads(output_path.read_text(encoding="utf-8"))
             text = (data.get("text") or "").strip()
@@ -602,17 +677,22 @@ def generate_report(
         elif proc.returncode == 0:
             reason = "il modello non ha restituito alcun risultato."
         else:
-            detail = ((child_err or "") + (child_out or "")).strip()
+            child_err = ""
+            try:
+                child_err = error_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+            detail = (child_err + "\n" + (child_out or "")).strip()
             log.error(
                 "Generazione del report fallita (codice %s): %s",
                 proc.returncode,
-                detail[:2000],
+                detail[-3000:] or "(nessun messaggio dal processo)",
             )
-            reason = (
-                "il modello linguistico non e' compatibile con questo "
-                "processore oppure la memoria disponibile non e' sufficiente."
-            )
+            reason = _spiega_uscita(proc.returncode, detail)
 
+    except DownloadCancelledReport:
+        log.info("Generazione del report annullata prima dell'avvio")
+        reason = "la generazione e' stata annullata."
     except subprocess.TimeoutExpired:
         log.error("Generazione del report interrotta per timeout")
         try:
@@ -625,7 +705,7 @@ def generate_report(
         log.exception("Errore imprevisto nella generazione del report")
         reason = f"errore imprevisto ({type(exc).__name__})."
     finally:
-        for path in (input_path, output_path):
+        for path in (input_path, output_path, tmp_dir / "errori.txt"):
             try:
                 path.unlink(missing_ok=True)
             except Exception:
@@ -710,9 +790,6 @@ def generate_report_child(input_path: str, output_path: str) -> int:
             n_threads=threads,
             n_threads_batch=threads,
             n_batch=batch,
-            # Micro-lotto pari al lotto: su CPU la lettura del prompt
-            # procede a blocchi piu' grandi, con meno passaggi sui pesi.
-            n_ubatch=batch,
             verbose=False,
         )
 
