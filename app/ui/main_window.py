@@ -547,10 +547,10 @@ class MainWindow(QMainWindow):
         for size in config.WHISPER_MODEL_SIZES:
             self.model_combo.addItem(
                 {
-                    "tiny": "Minimo — velocissimo, meno preciso",
-                    "base": "Base — veloce, consigliato su PC modesti",
-                    "small": "Piccolo — piu' preciso, richiede 4 core o piu'",
-                    "medium": "Medio — molto preciso, solo su PC potenti",
+                    "tiny": "Minimo — velocissimo, in italiano capisce poco",
+                    "base": "Base — veloce, in italiano sbaglia spesso",
+                    "small": "Piccolo — consigliato per l'italiano",
+                    "medium": "Medio — il piu' preciso, solo su PC potenti",
                 }[size],
                 size,
             )
@@ -561,12 +561,23 @@ class MainWindow(QMainWindow):
         )
 
         self.language_combo = QComboBox()
-        self.language_combo.addItem("Rilevamento automatico", "auto")
+        self.language_combo.addItem(
+            "Rilevamento automatico — meno preciso sulle prime battute", "auto"
+        )
         for code, name in (
             ("it", "Italiano"), ("en", "Inglese"), ("es", "Spagnolo"),
             ("fr", "Francese"), ("de", "Tedesco"), ("pt", "Portoghese"),
         ):
             self.language_combo.addItem(name, code)
+        # Indicare la lingua a mano toglie di mezzo il riconoscimento
+        # automatico, che sulle frasi brevi di apertura ("Buongiorno",
+        # "Mi sente?") sbaglia spesso: quando sbaglia, l'audio italiano
+        # viene decodificato come se fosse un'altra lingua e ne esce
+        # testo senza senso.
+        self.language_combo.setToolTip(
+            "Se il colloquio e' sempre nella stessa lingua, indicala qui: "
+            "la trascrizione diventa piu' precisa fin dalla prima frase."
+        )
         self._select_data(
             self.language_combo,
             settings.get("transcription_language"),
@@ -780,14 +791,41 @@ class MainWindow(QMainWindow):
 
     def _on_ready(self, compatible_mode: bool, message: str) -> None:
         self.progress_bar.setVisible(False)
+        self.progress_bar.setRange(0, 100)
         self.engine_ready = True
         self.record_button.setEnabled(True)
         self.retest_button.setEnabled(True)
+        self.header_dot.set_color(theme.SUCCESS)
         self.status_label.setText(
             "Pronto. Inserisci il nome del candidato e avvia il colloquio."
         )
         if message:
             self._add_warning(message)
+        self._check_model_for_language()
+
+    def _check_model_for_language(self) -> None:
+        """
+        Avverte se il modello scelto e' troppo piccolo per la lingua.
+
+        Whisper e' addestrato per circa due terzi su materiale inglese:
+        i modelli piccoli capiscono l'inglese molto meglio di qualunque
+        altra lingua. Sull'italiano 'base' produce un testo spesso
+        incomprensibile, mentre lo stesso modello sull'inglese sembra
+        funzionare bene — ed e' esattamente la differenza che si nota
+        usando l'app. Meglio dirlo che lasciarlo scoprire a colloquio in
+        corso.
+        """
+        modello = settings.get("whisper_model_size", "small")
+        lingua = settings.get("transcription_language", "auto")
+        if modello not in ("tiny", "base") or lingua == "en":
+            return
+        quale = "in italiano" if lingua == "it" else "in una lingua diversa dall'inglese"
+        self._add_warning(
+            f"Il modello di trascrizione '{modello}' e' il piu' veloce ma anche "
+            f"il meno preciso, e {quale} sbaglia molto piu' spesso che in "
+            "inglese. Se la trascrizione risulta poco comprensibile, passa a "
+            "'Piccolo' (o 'Medio') nelle impostazioni."
+        )
 
     def _on_preparation_failed(self, message: str, detail: str) -> None:
         self.progress_bar.setVisible(False)
@@ -1585,12 +1623,19 @@ class MainWindow(QMainWindow):
 
         if new_model != previous_model or new_cpu != previous_cpu:
             settings.set_many({"engine_selftest": "", "engine_selftest_size": ""})
+            # Il modello viene caricato all'inizio di ogni colloquio, non
+            # all'avvio del programma: chiedere di chiudere e riaprire non
+            # serviva a nulla. Prepariamo subito il nuovo modello —
+            # scaricandolo se manca — cosi' l'utente resta dentro l'app e
+            # vede l'avanzamento invece di un messaggio da eseguire a mano.
             QMessageBox.information(
                 self,
                 "Impostazioni salvate",
-                "Chiudi e riapri l'applicazione per applicare le nuove "
-                "impostazioni del motore di trascrizione.",
+                "Preparo il modello di trascrizione scelto. Se non e' ancora "
+                "sul computer verra' scaricato adesso: puoi seguire "
+                "l'avanzamento nella barra in basso.",
             )
+            self._start_preparation()
         else:
             QMessageBox.information(
                 self, "Impostazioni salvate", "Le modifiche sono state applicate."

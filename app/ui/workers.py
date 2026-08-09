@@ -80,12 +80,16 @@ class StartupWorker(QThread):
             if self._stopped():
                 return
 
-            settings.set_many(
-                {
-                    "engine_selftest": result.state,
-                    "engine_selftest_size": self.whisper_size,
-                }
-            )
+            # L'esito viene memorizzato solo se e' un verdetto vero. Un
+            # test non concluso non va salvato: altrimenti al riavvio
+            # verrebbe riletto come "guasto" e non si ritenterebbe mai.
+            if result.state:
+                settings.set_many(
+                    {
+                        "engine_selftest": result.state,
+                        "engine_selftest_size": self.whisper_size,
+                    }
+                )
 
             if self._stopped():
                 return
@@ -99,10 +103,27 @@ class StartupWorker(QThread):
                         "trascrizione sara' piu' lenta ma stabile."
                     )
                 self.finished_ok.emit(result.compatible_mode, message)
+            elif result.inconclusive:
+                # Il controllo non ha dato risposta: NON e' un guasto.
+                # Bloccare qui la registrazione significava lasciare
+                # l'utente senza programma per un semplice controllo
+                # preventivo andato storto — il piu' delle volte perche'
+                # aveva scelto un modello piu' grande e il test scadeva.
+                log.warning("Controllo preventivo non concluso: %s", result.reason)
+                self.finished_ok.emit(
+                    False,
+                    "Non e' stato possibile completare il controllo preventivo "
+                    f"del motore di trascrizione: {result.reason}. "
+                    "Puoi comunque registrare: se durante il colloquio dovessi "
+                    "notare problemi, prova un modello piu' leggero dalle "
+                    "impostazioni.",
+                )
             else:
                 self.failed.emit(
                     "Il motore di trascrizione non riesce ad avviarsi su questo "
-                    "computer. Le funzioni di registrazione sono disattivate.",
+                    "computer: il processore non supporta le istruzioni "
+                    "richieste. Prova a impostare 'Compatibilita'' nelle "
+                    "impostazioni, alla voce Prestazioni.",
                     result.detail,
                 )
         except model_download.DownloadCancelled:
