@@ -18,7 +18,7 @@
 ; cosi' la build automatica la prende da app/config.py e non esiste modo
 ; di pubblicare un installer che dichiara un numero diverso dal programma.
 #ifndef MyAppVersion
-  #define MyAppVersion "3.1.0"
+  #define MyAppVersion "3.2.0"
 #endif
 #define MyAppPublisher "Interview Assistant"
 #define MyAppExeName "InterviewAssistant.exe"
