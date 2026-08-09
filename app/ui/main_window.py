@@ -547,9 +547,9 @@ class MainWindow(QMainWindow):
         for size in config.WHISPER_MODEL_SIZES:
             self.model_combo.addItem(
                 {
-                    "tiny": "Minimo — velocissimo, in italiano capisce poco",
-                    "base": "Base — veloce, in italiano sbaglia spesso",
-                    "small": "Piccolo — consigliato per l'italiano",
+                    "tiny": "Minimo — il piu' veloce, il meno preciso",
+                    "base": "Base — veloce, precisione limitata",
+                    "small": "Piccolo — buon equilibrio (consigliato)",
                     "medium": "Medio — il piu' preciso, solo su PC potenti",
                 }[size],
                 size,
@@ -571,9 +571,9 @@ class MainWindow(QMainWindow):
             self.language_combo.addItem(name, code)
         # Indicare la lingua a mano toglie di mezzo il riconoscimento
         # automatico, che sulle frasi brevi di apertura ("Buongiorno",
-        # "Mi sente?") sbaglia spesso: quando sbaglia, l'audio italiano
-        # viene decodificato come se fosse un'altra lingua e ne esce
-        # testo senza senso.
+        # "Mi sente?") sbaglia con una certa frequenza: quando sbaglia,
+        # l'audio viene decodificato come se fosse un'altra lingua e ne
+        # esce testo senza senso. Vale per qualunque lingua.
         self.language_combo.setToolTip(
             "Se il colloquio e' sempre nella stessa lingua, indicala qui: "
             "la trascrizione diventa piu' precisa fin dalla prima frase."
@@ -801,30 +801,17 @@ class MainWindow(QMainWindow):
         )
         if message:
             self._add_warning(message)
-        self._check_model_for_language()
+        self._check_model_accuracy()
 
-    def _check_model_for_language(self) -> None:
-        """
-        Avverte se il modello scelto e' troppo piccolo per la lingua.
-
-        Whisper e' addestrato per circa due terzi su materiale inglese:
-        i modelli piccoli capiscono l'inglese molto meglio di qualunque
-        altra lingua. Sull'italiano 'base' produce un testo spesso
-        incomprensibile, mentre lo stesso modello sull'inglese sembra
-        funzionare bene — ed e' esattamente la differenza che si nota
-        usando l'app. Meglio dirlo che lasciarlo scoprire a colloquio in
-        corso.
-        """
+    def _check_model_accuracy(self) -> None:
+        """Avverte se e' in uso uno dei modelli meno precisi."""
         modello = settings.get("whisper_model_size", "small")
-        lingua = settings.get("transcription_language", "auto")
-        if modello not in ("tiny", "base") or lingua == "en":
+        if modello not in ("tiny", "base"):
             return
-        quale = "in italiano" if lingua == "it" else "in una lingua diversa dall'inglese"
         self._add_warning(
-            f"Il modello di trascrizione '{modello}' e' il piu' veloce ma anche "
-            f"il meno preciso, e {quale} sbaglia molto piu' spesso che in "
-            "inglese. Se la trascrizione risulta poco comprensibile, passa a "
-            "'Piccolo' (o 'Medio') nelle impostazioni."
+            f"Il modello di trascrizione '{modello}' e' fra i piu' rapidi ma "
+            "anche fra i meno precisi. Se la trascrizione risulta poco "
+            "comprensibile, passa a 'Piccolo' o 'Medio' nelle impostazioni."
         )
 
     def _on_preparation_failed(self, message: str, detail: str) -> None:
