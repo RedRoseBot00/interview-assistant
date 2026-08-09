@@ -13,6 +13,11 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    # Senza un limite, un processo che si blocca (una finestra di errore
+    # che nessuno puo' chiudere, un download che non risponde) terrebbe
+    # occupata la macchina per sei ore prima di arrendersi, senza
+    # produrre alcuna informazione utile.
+    timeout-minutes: 45
 
     steps:
       - name: Scarica il codice del progetto
@@ -50,25 +55,29 @@ jobs:
           }
           if ($p.ExitCode -ne 0) { throw "Verifica del pacchetto fallita (codice $($p.ExitCode))" }
 
-      - name: Installa Inno Setup
-        run: choco install innosetup -y --no-progress
-
-      - name: Crea l'installer .exe
-        shell: pwsh
-        run: |
-          $iscc = Get-ChildItem "C:\Program Files (x86)\Inno Setup *\ISCC.exe" | Select-Object -First 1
-          if (-not $iscc) { throw "ISCC.exe non trovato" }
-          & $iscc.FullName build\installer.iss
-
       - name: Leggi il numero di versione
-        # Il numero finisce nel nome del file scaricabile: cosi' non c'e'
-        # modo di confondere una build con quella precedente.
+        # Unica fonte del numero di versione: app/config.py. Va letto
+        # PRIMA di creare l'installer, cosi' e' lo stesso valore a
+        # finire nel programma, nell'installer e nel nome del file
+        # scaricabile. Prima erano tre valori scritti a mano in tre
+        # punti diversi, senza nulla che ne verificasse l'accordo.
         id: versione
         shell: pwsh
         run: |
           $v = (Select-String -Path app/config.py -Pattern 'APP_VERSION\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          if (-not $v) { throw "Numero di versione non trovato in app/config.py" }
           "numero=$v" >> $env:GITHUB_OUTPUT
           Write-Host "Versione rilevata: $v"
+
+      - name: Crea l'installer .exe
+        # Inno Setup e' gia' presente sulle macchine Windows di GitHub:
+        # installarlo da capo costava un minuto per build e aggiungeva
+        # una dipendenza da un servizio esterno che puo' non rispondere.
+        shell: pwsh
+        run: |
+          $iscc = Get-ChildItem "C:\Program Files (x86)\Inno Setup *\ISCC.exe" | Select-Object -First 1
+          if (-not $iscc) { throw "ISCC.exe non trovato" }
+          & $iscc.FullName /DMyAppVersion=${{ steps.versione.outputs.numero }} build\installer.iss
 
       - name: Carica l'installer come risultato della build
         uses: actions/upload-artifact@v4
