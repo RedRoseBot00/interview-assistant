@@ -11,7 +11,7 @@ from pathlib import Path
 
 APP_NAME = "InterviewAssistant"
 APP_DISPLAY_NAME = "Interview Assistant"
-APP_VERSION = "0.2.1"
+APP_VERSION = "0.2.2"
 
 # --------------------------------------------------------------------------
 # Percorsi applicazione

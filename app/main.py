@@ -54,8 +54,21 @@ def run_gui() -> int:
     app.setApplicationName("InterviewAssistant")
     app.setOrganizationName("InterviewAssistant")
 
-    from app import config
+    from app import config, single_instance
     from app.ui import theme
+
+    # Due copie aperte insieme si contendono modelli, archivio e
+    # microfono: meglio dirlo subito e con chiarezza.
+    if not single_instance.acquire():
+        QMessageBox.information(
+            None,
+            "Applicazione gia' aperta",
+            f"{config.APP_DISPLAY_NAME} e' gia' in esecuzione.\n\n"
+            "Cerca la finestra gia' aperta nella barra delle applicazioni. "
+            "Se non la trovi, chiudi il programma dal Gestione attivita' e "
+            "riprova.",
+        )
+        return 0
 
     app.setApplicationVersion(config.APP_VERSION)
     app.setStyleSheet(theme.STYLESHEET)
@@ -76,7 +89,10 @@ def run_gui() -> int:
         )
         return 1
 
-    return app.exec()
+    try:
+        return app.exec()
+    finally:
+        single_instance.release()
 
 
 def main() -> int:
