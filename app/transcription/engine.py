@@ -19,7 +19,9 @@ copia di quello, scartati o ripuliti (vedi app/audio/echo.py).
 from __future__ import annotations
 
 import logging
+import os
 import queue
+import sys
 import threading
 import time
 from collections import Counter, deque
@@ -55,6 +57,10 @@ REFERENCE_WAIT_SECONDS = 1.2
 MERGE_GAP_SECONDS = 1.5
 MERGE_MAX_SECONDS = 26.0
 MERGE_LOOKAHEAD = 32
+# Quanto parlato si puo' tenere da parte per l'accorpamento. Serve solo
+# a riempire una finestra da ventisei secondi: tutto cio' che eccede e'
+# tempo sottratto al conteggio dell'arretrato senza alcun vantaggio.
+LOOKAHEAD_MAX_SECONDS = 30.0
 
 # Quando la coda cresce, l'unica cosa che conta e' tornare al presente:
 # si accorpa fino al limite di durata ignorando la lunghezza delle
@@ -288,6 +294,7 @@ class TranscriptionEngine:
 
         self.segments: list[TranscriptSegment] = []
         self.backlog = 0
+        self.backlog_seconds = 0.0
 
         self._languages: Counter[str] = Counter()
         self._last_text: dict[str, str] = {}
@@ -340,10 +347,23 @@ class TranscriptionEngine:
             cpu_threads=config.transcription_threads(),
             num_workers=1,
         )
+        # Queste righe sono la prima cosa da leggere quando un utente
+        # segnala lentezza: dicono con quanti thread si sta lavorando e
+        # con quale precisione. Senza, un computer che gira con un solo
+        # thread o con i kernel generici e' indistinguibile da uno che
+        # gira come dovrebbe.
+        interno = getattr(self._model, "model", None)
         log.info(
-            "Modello '%s' caricato in %.1f s",
+            "Modello '%s' caricato in %.1f s — %d thread "
+            "(core fisici %s, logici %s), precisione richiesta '%s', "
+            "effettiva '%s'",
             self.model_size,
             time.monotonic() - started,
+            config.transcription_threads(),
+            config._physical_cores(),
+            os.cpu_count(),
+            config.WHISPER_COMPUTE_TYPE,
+            getattr(interno, "compute_type", "sconosciuta"),
         )
 
     # ------------------------------------------------------------------
@@ -387,6 +407,25 @@ class TranscriptionEngine:
         self._thread = None
         return True
 
+    def release_model(self) -> None:
+        """
+        Restituisce alla macchina la memoria del modello.
+
+        Va chiamata a colloquio finito. Subito dopo il programma carica
+        il modello che scrive il report, che pesa due gigabyte: tenere in
+        piedi anche questo, che non serve piu' a nessuno, e' quanto basta
+        perche' un computer con quattro gigabyte di memoria cominci a
+        lavorare sul disco invece che in memoria — ed e' la situazione
+        normale su una macchina virtuale.
+        """
+        if self._model is None:
+            return
+        self._model = None
+        import gc
+
+        gc.collect()
+        log.info("Modello di trascrizione rilasciato")
+
     # ------------------------------------------------------------------
     def _notify_status(self, message: str) -> None:
         if self.on_status:
@@ -395,7 +434,40 @@ class TranscriptionEngine:
             except Exception:
                 log.debug("Notifica di stato fallita", exc_info=True)
 
+    @staticmethod
+    def _lower_own_priority() -> None:
+        """
+        Abbassa la priorita' del thread che esegue il riconoscimento.
+
+        La trascrizione e' un lavoro pesante ma NON urgente: puo'
+        arrivare mezzo secondo dopo senza che nessuno se ne accorga.
+        L'interfaccia, la cattura audio e il servizio grafico di Windows
+        sono invece urgenti: un loro ritardo si vede subito, sotto forma
+        di finestra che non risponde e anteprima a scatti.
+
+        A parita' di priorita' Windows alterna i thread a rotazione, e un
+        calcolo che tiene il processore occupato senza pause vince quasi
+        sempre il confronto. Bastano due gradini in meno perche' il
+        sistema restituisca la precedenza a chi disegna lo schermo, senza
+        che la trascrizione ci perda in pratica nulla: il processore
+        resta comunque suo per quasi tutto il tempo.
+        """
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+
+            THREAD_PRIORITY_BELOW_NORMAL = -1
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            if not kernel32.SetThreadPriority(
+                kernel32.GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL
+            ):
+                log.debug("Priorita' del thread non modificata")
+        except Exception:
+            log.debug("Priorita' del thread non modificabile", exc_info=True)
+
     def _run(self, audio_queue: "queue.Queue[AudioChunk]") -> None:
+        self._lower_own_priority()
         try:
             if self._model is None:
                 self.load_model()
@@ -414,6 +486,13 @@ class TranscriptionEngine:
                 chunk = self._next_chunk(audio_queue, timeout=0.4)
             except queue.Empty:
                 self.backlog = len(self._waiting) + len(self._local)
+                # Va aggiornato anche qui: quando non arriva nulla di
+                # nuovo restava fermo al valore dell'ultimo blocco, e
+                # l'avviso "non sta al passo" poteva restare acceso
+                # mentre l'arretrato si stava smaltendo.
+                in_attesa = getattr(audio_queue, "pending_seconds", None)
+                if in_attesa is not None:
+                    self.backlog_seconds = float(in_attesa)
                 try:
                     self._flush_waiting(force=self._stop.is_set())
                 except Exception as exc:
@@ -427,6 +506,20 @@ class TranscriptionEngine:
                 continue
 
             self.backlog = audio_queue.qsize() + len(self._local) + len(self._waiting)
+            # Secondi di parlato ancora da trascrivere. E' questo, non il
+            # numero di elementi, a dire se si e' indietro: il canale del
+            # candidato manda due avvisi di silenzio al secondo, che non
+            # valgono nulla ma facevano salire il conteggio a quattro nel
+            # giro di due secondi. L'avviso "non sta al passo" compariva
+            # cosi' quasi sempre, anche a trascrizione perfettamente in
+            # pari, e falsava la diagnosi di chi cercava il problema.
+            # pending_seconds comprende gia' quello che abbiamo in mano,
+            # _local e _waiting inclusi: e' _update_parked a dichiararlo
+            # alla coda. Sommarci di nuovo _waiting lo contava due volte.
+            in_coda = getattr(audio_queue, "pending_seconds", None)
+            self.backlog_seconds = (
+                float(self.backlog) if in_coda is None else float(in_coda)
+            )
             try:
                 self._accept(self._merge_following(audio_queue, chunk))
             except Exception as exc:
@@ -476,11 +569,27 @@ class TranscriptionEngine:
         return blocco
 
     def _fill_local(self, audio_queue: "queue.Queue[AudioChunk]") -> None:
+        """
+        Sbircia le frasi successive per capire se si possono accorpare.
+
+        Il limite e' doppio, per numero e per durata. Contare solo gli
+        elementi non bastava: una frase puo' durare dieci secondi, quindi
+        trentadue elementi potevano valere piu' di cinque minuti di
+        parlato tolti dalla coda e tenuti da parte. Quel tempo spariva
+        dalla vista del limite sull'arretrato e faceva scattare a vuoto
+        lo scarto dell'audio piu' vecchio. Le frasi che restano in coda
+        non si perdono: vengono prelevate al giro successivo.
+        """
+        raccolti = self._durata_locale()
         try:
-            while len(self._local) < MERGE_LOOKAHEAD:
+            while (
+                len(self._local) < MERGE_LOOKAHEAD
+                and raccolti < LOOKAHEAD_MAX_SECONDS
+            ):
                 nuovo = audio_queue.get_nowait()
                 self._local.append(nuovo)
                 self._note_arrival(nuovo)
+                raccolti += nuovo.samples.size / float(config.AUDIO_SAMPLE_RATE)
         except queue.Empty:
             pass
         self._update_parked(audio_queue)
@@ -741,6 +850,12 @@ class TranscriptionEngine:
         audio = _normalise_gain(_tame_peaks(np.asarray(chunk.samples, dtype=np.float32)))
 
         if _loudest_rms(audio) < config.SILENCE_RMS_THRESHOLD:
+            # Va dimenticato anche l'ultimo testo di questo interlocutore,
+            # come fa ogni altro scarto. Era l'unico ramo che se ne
+            # dimenticava: la frase seguente, marcata come continuazione,
+            # veniva confrontata con un testo vecchio di secondi e
+            # perdeva le proprie parole iniziali.
+            self._forget_last(chunk.speaker)
             return
 
         duration = audio.size / config.AUDIO_SAMPLE_RATE
@@ -757,7 +872,7 @@ class TranscriptionEngine:
         sonda = self._should_probe_language(parlato)
         lingua_chiamata = None if sonda else self._locked_language
 
-        fascio, temperature = self._decoding_quality()
+        fascio, temperature, ipotesi = self._decoding_quality()
 
         started = time.monotonic()
         segments, info = self._model.transcribe(
@@ -766,7 +881,7 @@ class TranscriptionEngine:
             # Ampiezza della ricerca e scala dei tentativi decise in base
             # a quanto il computer sta al passo: vedi _decoding_quality.
             beam_size=fascio,
-            best_of=5,
+            best_of=ipotesi,
             temperature=temperature,
             # Il silenzio l'abbiamo gia' tolto noi con il rilevatore di
             # voce: rifarlo qui costerebbe tempo per nulla.
@@ -889,7 +1004,7 @@ class TranscriptionEngine:
         with self._lock:
             self._last_text.pop(speaker, None)
 
-    def _decoding_quality(self) -> tuple[int, tuple[float, ...]]:
+    def _decoding_quality(self) -> tuple[int, tuple[float, ...], int]:
         """
         Quanta cura mettere nella trascrizione del prossimo blocco.
 
@@ -921,11 +1036,21 @@ class TranscriptionEngine:
         elif self._speed_samples >= 3 and margine >= config.SPEED_RAISE_QUALITY:
             self._quality_level = min(2, self._quality_level + 1)
 
+        # Il terzo valore e' il numero di ipotesi generate quando scatta
+        # un tentativo a temperatura piu' alta. Restava fisso a cinque
+        # anche al livello piu' basso, cioe' proprio sul computer che non
+        # sta al passo: in quel caso il ripiego, che sulle frasi brevi e
+        # disturbate di un colloquio scatta spesso, costava cinque
+        # decodifiche invece di una. Al livello minimo se ne genera una
+        # sola: il tentativo di recupero resta, il conto no.
         if self._quality_level >= 2:
-            return config.DECODE_BEAM_MAX, config.DECODE_TEMPERATURES_FULL
+            return (config.DECODE_BEAM_MAX, config.DECODE_TEMPERATURES_FULL,
+                    config.DECODE_BEST_OF_MAX)
         if self._quality_level == 1:
-            return config.DECODE_BEAM_MID, config.DECODE_TEMPERATURES_FULL
-        return config.DECODE_BEAM_MIN, config.DECODE_TEMPERATURES_FAST
+            return (config.DECODE_BEAM_MID, config.DECODE_TEMPERATURES_FULL,
+                    config.DECODE_BEST_OF_MAX)
+        return (config.DECODE_BEAM_MIN, config.DECODE_TEMPERATURES_FAST,
+                config.DECODE_BEST_OF_MIN)
 
     def _prompt_for_call(self, language: Optional[str]) -> Optional[str]:
         """
