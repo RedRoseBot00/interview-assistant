@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 
 from PySide6.QtCore import QThread, Signal
 
@@ -44,6 +45,23 @@ class StartupWorker(QThread):
         self._cancel.set()
         self.requestInterruption()
 
+    def _selftest_fingerprint(self) -> str:
+        """
+        Su cosa vale l'esito del controllo preventivo.
+
+        Versione del programma (e quindi delle librerie di calcolo),
+        processore e modello di trascrizione. Se una di queste tre cose
+        cambia il verdetto va rifatto; se restano identiche, ripeterlo e'
+        solo tempo tolto all'utente prima di poter registrare.
+        """
+        from app import compat, config
+
+        try:
+            macchina = compat.native_machine()
+        except Exception:
+            macchina = "?"
+        return f"{config.APP_VERSION}|{macchina}|{self.whisper_size}"
+
     def _stopped(self) -> bool:
         return self._cancel.is_set() or self.isInterruptionRequested()
 
@@ -68,8 +86,20 @@ class StartupWorker(QThread):
                 return
 
             state = settings.get("engine_selftest", "")
-            tested_size = settings.get("engine_selftest_size", "")
-            if state in ("ok", "ok-compatible") and tested_size == self.whisper_size:
+            # L'esito vale per QUESTA versione del programma, su QUESTO
+            # processore e per QUESTO modello. Prima si confrontava solo
+            # il modello: aggiornando il programma — e con lui le
+            # librerie di calcolo — si ereditava una diagnosi presa su
+            # un'altra libreria. Ripetere il controllo a ogni avvio
+            # sarebbe pero' molto peggio: su una macchina che richiede la
+            # modalita' compatibilita' significa caricare due volte il
+            # modello prima di poter registrare, fino a diversi minuti di
+            # attesa a ogni apertura.
+            impronta = self._selftest_fingerprint()
+            if (
+                state in ("ok", "ok-compatible")
+                and settings.get("engine_selftest_fingerprint", "") == impronta
+            ):
                 self.finished_ok.emit(state == "ok-compatible", "")
                 return
 
@@ -88,6 +118,7 @@ class StartupWorker(QThread):
                     {
                         "engine_selftest": result.state,
                         "engine_selftest_size": self.whisper_size,
+                        "engine_selftest_fingerprint": impronta,
                     }
                 )
 
@@ -186,11 +217,31 @@ class ReportWorker(QThread):
         try:
             from app.summarization.llm import generate_report
 
+            # Il processo che scrive il report manda una parola alla
+            # volta. Rilanciarle una per una significa centinaia di
+            # eventi da smaltire sul filo che disegna la finestra,
+            # ciascuno con il suo riposizionamento della barra di
+            # scorrimento: quasi un secondo di lavoro per un testo che
+            # l'occhio non riesce comunque a seguire piu' di dieci volte
+            # al secondo. Qui si raccolgono e si mandano a gruppi.
+            accumulato: list[str] = []
+            ultimo = 0.0
+
             def _partial(pezzo: str) -> None:
-                if not self.isInterruptionRequested():
-                    self.partial.emit(pezzo)
+                nonlocal ultimo
+                if self.isInterruptionRequested():
+                    return
+                accumulato.append(pezzo)
+                adesso = time.monotonic()
+                if adesso - ultimo >= 0.10:
+                    ultimo = adesso
+                    self.partial.emit("".join(accumulato))
+                    accumulato.clear()
 
             result = generate_report(on_partial=_partial, **self._args)
+            # L'ultimo pezzo non deve restare nel cassetto.
+            if accumulato and not self.isInterruptionRequested():
+                self.partial.emit("".join(accumulato))
             if not self.isInterruptionRequested():
                 self.finished_ok.emit(result)
         except Exception as exc:

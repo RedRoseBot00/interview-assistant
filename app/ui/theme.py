@@ -8,6 +8,8 @@ marchio del cliente finale senza toccare la logica delle schermate.
 """
 from __future__ import annotations
 
+import math
+
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QPainter
 from PySide6.QtWidgets import QFrame, QLabel, QVBoxLayout, QWidget
@@ -320,14 +322,23 @@ class LevelMeter(QWidget):
     def set_level(self, value: float) -> None:
         # Scala logaritmica: la voce umana occupa una porzione ridotta
         # della scala lineare e la barra sembrerebbe sempre ferma.
-        import math
-
         if value <= 0:
             normalised = 0.0
         else:
             db = 20 * math.log10(max(value, 1e-6))
             normalised = (db + 60) / 60  # -60 dB -> 0, 0 dB -> 1
-        self._level = max(0.0, min(1.0, normalised))
+        nuovo = max(0.0, min(1.0, normalised))
+
+        # La barra e' larga una novantina di pixel: una variazione sotto
+        # un centesimo non sposta nemmeno un pixel. Chiedere comunque il
+        # ridisegno significava, in silenzio, venticinque ricomposizioni
+        # al secondo dell'intera finestra per non cambiare nulla — ed e'
+        # l'unica attivita' grafica continua durante la registrazione,
+        # quella che su una macchina virtuale contende il processore al
+        # servizio che disegna l'anteprima della videochiamata.
+        if abs(nuovo - self._level) < 0.01:
+            return
+        self._level = nuovo
         self.update()
 
     def paintEvent(self, event):  # noqa: N802 - firma imposta da Qt

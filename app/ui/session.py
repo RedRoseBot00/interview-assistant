@@ -238,6 +238,23 @@ class InterviewSession(QObject):
         for message in nuovi:
             self.warning_raised.emit(message)
 
+        # Il modello di trascrizione occupa centinaia di megabyte e non
+        # serve piu' a nulla: il colloquio e' finito, e subito dopo il
+        # programma ne carica un altro da due gigabyte per scrivere il
+        # report. Su una macchina con quattro gigabyte di memoria — cioe'
+        # su quasi ogni macchina virtuale — tenerli in memoria insieme
+        # significa spostare mezza applicazione sul disco.
+        #
+        # Non basta smettere di usarlo: l'oggetto sessione e il thread
+        # di avvio si tengono l'un l'altro, e finche' quel cerchio non si
+        # spezza nessuno dei due viene liberato. Qui lo si spezza e si
+        # chiede esplicitamente di fare pulizia.
+        self._start_thread = None
+        try:
+            self.engine.release_model()
+        except Exception:
+            log.debug("Modello di trascrizione non liberato", exc_info=True)
+
         self.clean_shutdown = clean
         with self._lifecycle:
             self._stopping = False
@@ -265,6 +282,11 @@ class InterviewSession(QObject):
     @property
     def pending_chunks(self) -> int:
         return self.engine.backlog
+
+    @property
+    def pending_seconds(self) -> float:
+        """Secondi di parlato ancora da trascrivere."""
+        return float(getattr(self.engine, "backlog_seconds", 0.0))
 
     @property
     def speakers_detected(self) -> bool:

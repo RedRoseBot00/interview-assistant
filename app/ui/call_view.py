@@ -24,10 +24,11 @@ from __future__ import annotations
 import ctypes
 import logging
 import sys
+import time
 from ctypes import wintypes
 from dataclasses import dataclass
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
@@ -36,6 +37,19 @@ from app.ui import theme
 log = logging.getLogger(__name__)
 
 IS_WINDOWS = sys.platform == "win32"
+
+# Ogni riallineamento della miniatura e' una richiesta al servizio di
+# composizione di Windows. Su un computer senza scheda grafica dedicata
+# — e su una macchina virtuale sempre — quel servizio disegna con il
+# processore: trascinando o ridimensionando la finestra arrivavano
+# decine di richieste al secondo, e l'immagine della videochiamata
+# diventava a scatti. Qui se ne lascia passare al massimo una ogni
+# sessantesimo di secondo, con l'ultima sempre garantita.
+REFRESH_MIN_INTERVAL_MS = 60.0
+# Le dimensioni della finestra di origine cambiano solo quando qualcuno
+# la ridimensiona: chiederle a ogni riallineamento e' una chiamata al
+# sistema sprecata.
+SOURCE_SIZE_INTERVAL = 0.75
 
 # Costanti dell'API DWM
 DWM_TNP_RECTDESTINATION = 0x00000001
@@ -74,13 +88,21 @@ class WindowInfo:
 
 
 # Processi che con ogni probabilita' contengono una videochiamata.
-_CALL_PROCESSES = {
+CALL_PROCESSES = {
     "teams.exe", "ms-teams.exe", "zoom.exe", "cpthost.exe",
     "webexmta.exe", "webex.exe", "skype.exe", "gotomeeting.exe",
     "slack.exe", "discord.exe",
 }
-_BROWSER_PROCESSES = {"chrome.exe", "msedge.exe", "firefox.exe", "brave.exe"}
-_MEETING_HINTS = ("meet", "zoom", "teams", "webex", "riunione", "meeting", "call")
+BROWSER_PROCESSES = {"chrome.exe", "msedge.exe", "firefox.exe", "brave.exe"}
+MEETING_HINTS = ("meet", "zoom", "teams", "webex", "riunione", "meeting", "call")
+
+
+# Nome del programma per numero di processo. Chiederlo al sistema
+# significa aprire il processo e interrogarlo: con quaranta finestre
+# aperte erano quaranta operazioni a ogni aggiornamento dell'elenco,
+# tutte sul filo che disegna la finestra. Il nome di un processo non
+# cambia mai finche' il processo vive, quindi si ricorda.
+_process_cache: dict[int, str] = {}
 
 
 def _process_name(handle: int) -> str:
@@ -93,7 +115,17 @@ def _process_name(handle: int) -> str:
         )
         if not pid.value:
             return ""
-        return psutil.Process(pid.value).name()
+        noto = _process_cache.get(pid.value)
+        if noto is not None:
+            return noto
+        nome = psutil.Process(pid.value).name()
+        if len(_process_cache) > 512:
+            # Un colloquio non apre mai cosi' tanti programmi: se ci
+            # arriviamo e' segno che i numeri vengono riciclati, e la
+            # tabella va ricominciata da capo.
+            _process_cache.clear()
+        _process_cache[pid.value] = nome
+        return nome
     except Exception:
         return ""
 
@@ -160,11 +192,11 @@ def list_windows(exclude: int = 0) -> list[WindowInfo]:
         return []
 
     def _rank(info: WindowInfo) -> tuple[int, str]:
-        if info.process in _CALL_PROCESSES:
+        if info.process in CALL_PROCESSES:
             return (0, info.title.lower())
-        if info.process in _BROWSER_PROCESSES:
+        if info.process in BROWSER_PROCESSES:
             lowered = info.title.lower()
-            if any(hint in lowered for hint in _MEETING_HINTS):
+            if any(hint in lowered for hint in MEETING_HINTS):
                 return (1, lowered)
             return (2, lowered)
         return (3, info.title.lower())
@@ -176,10 +208,10 @@ def list_windows(exclude: int = 0) -> list[WindowInfo]:
 def best_call_window(exclude: int = 0) -> WindowInfo | None:
     """Finestra piu' probabile della videochiamata, se ce n'e' una."""
     for info in list_windows(exclude):
-        if info.process in _CALL_PROCESSES:
+        if info.process in CALL_PROCESSES:
             return info
-        if info.process in _BROWSER_PROCESSES and any(
-            hint in info.title.lower() for hint in _MEETING_HINTS
+        if info.process in BROWSER_PROCESSES and any(
+            hint in info.title.lower() for hint in MEETING_HINTS
         ):
             return info
     return None
@@ -193,6 +225,11 @@ class CallView(QWidget):
         self._thumbnail = None
         self._source: WindowInfo | None = None
         self._source_size = (16, 9)
+        self._last_applied = 0.0
+        self._last_size_read = 0.0
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.timeout.connect(self._apply_refresh)
         self.setMinimumSize(320, 200)
         self.setAttribute(Qt.WA_OpaquePaintEvent, False)
 
@@ -231,8 +268,8 @@ class CallView(QWidget):
 
             self._thumbnail = thumbnail
             self._source = info
-            self._read_source_size()
-            self.refresh()
+            self._read_source_size(force=True)
+            self._apply_refresh()      # la prima volta senza attese
             return True
         except Exception:
             log.exception("Impossibile mostrare la finestra della videochiamata")
@@ -241,6 +278,7 @@ class CallView(QWidget):
             return False
 
     def clear(self) -> None:
+        self._refresh_timer.stop()
         if self._thumbnail is not None:
             try:
                 ctypes.windll.dwmapi.DwmUnregisterThumbnail(self._thumbnail)
@@ -251,7 +289,11 @@ class CallView(QWidget):
         self.update()
 
     # ------------------------------------------------------------------
-    def _read_source_size(self) -> None:
+    def _read_source_size(self, force: bool = False) -> None:
+        adesso = time.monotonic()
+        if not force and adesso - self._last_size_read < SOURCE_SIZE_INTERVAL:
+            return
+        self._last_size_read = adesso
         try:
             size = wintypes.SIZE()
             ctypes.windll.dwmapi.DwmQueryThumbnailSourceSize(
@@ -311,9 +353,33 @@ class CallView(QWidget):
             return True     # nel dubbio non buttiamo via l'anteprima
 
     def refresh(self) -> None:
-        """Riallinea la miniatura dopo spostamenti, ridimensionamenti o cambi di scheda."""
+        """
+        Riallinea la miniatura dopo spostamenti, ridimensionamenti o cambi
+        di scheda.
+
+        La prima richiesta parte subito, cosi' l'anteprima resta reattiva.
+        Quelle che arrivano a raffica — trascinando o ridimensionando la
+        finestra ne arrivano decine al secondo — vengono raccolte in una
+        sola, senza mai perdere l'ultima: e' quella che conta, perche'
+        descrive la posizione definitiva.
+        """
+        # Se il riquadro non e' a schermo — perche' si sta guardando il
+        # report, lo storico o le impostazioni — la miniatura resta
+        # registrata ma nessuno la vede: continuare a chiedere al
+        # sistema di riallinearla, venti volte al secondo mentre si
+        # sposta la finestra, e' lavoro puro sprecato.
+        if self._thumbnail is None or not self.isVisible():
+            return
+        trascorso = (time.monotonic() - self._last_applied) * 1000.0
+        if trascorso >= REFRESH_MIN_INTERVAL_MS:
+            self._apply_refresh()
+        elif not self._refresh_timer.isActive():
+            self._refresh_timer.start(int(REFRESH_MIN_INTERVAL_MS - trascorso) + 1)
+
+    def _apply_refresh(self) -> None:
         if self._thumbnail is None:
             return
+        self._last_applied = time.monotonic()
         if not self.source_alive():
             log.info("La finestra della videochiamata e' stata chiusa")
             self.clear()

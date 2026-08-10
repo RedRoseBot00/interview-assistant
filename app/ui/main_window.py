@@ -17,6 +17,7 @@ import sys
 from datetime import datetime
 
 from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QGuiApplication, QTextCursor
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -44,7 +45,14 @@ from app.audio import echo as echo_module
 from app.export.report import export_docx, export_txt
 from app.storage import db
 from app.ui import theme
-from app.ui.call_view import CallView, best_call_window, list_windows
+from app.ui.call_view import (
+    BROWSER_PROCESSES,
+    CALL_PROCESSES,
+    MEETING_HINTS,
+    CallView,
+    best_call_window,
+    list_windows,
+)
 from app.ui.session import InterviewSession
 from app.ui.theme import Card, Chip, LevelMeter, StatusDot
 from app.ui.workers import PlatformProbe, ReportWorker, StartupWorker
@@ -53,6 +61,13 @@ log = logging.getLogger(__name__)
 
 TAB_INTERVIEW = 0
 TAB_REPORT = 1
+
+# Quante righe di trascrizione tenere a schermo. Il riquadro ne mostra
+# una trentina: le altre servono solo a scorrere indietro di poco, e
+# ogni riga in piu' e' peso morto che Qt ricalcola a ogni
+# ridimensionamento della finestra. La trascrizione completa resta
+# comunque nel motore, nel report e nell'archivio.
+MAX_BLOCCHI_TRASCRIZIONE = 400
 
 
 class MainWindow(QMainWindow):
@@ -83,6 +98,14 @@ class MainWindow(QMainWindow):
         self._warnings: list[str] = []
         self._streamed_report = False
         self._stats_cache = ""
+        # Finestre aperte lette l'ultima volta, per numero identificativo.
+        self._known_windows: dict = {}
+        # Riquadri delle competenze: si riusano invece di ricrearli.
+        self._skill_chips: list = []
+        # Ultimi dati del candidato scritti nell'archivio.
+        self._ultimo_salvato: tuple | None = None
+        # Interventi arrivati mentre i sottotitoli erano nascosti.
+        self._segmenti_nascosti = 0
 
         db.init_db()
 
@@ -117,6 +140,14 @@ class MainWindow(QMainWindow):
         self._autosave_timer = QTimer(self)
         self._autosave_timer.setSingleShot(True)
         self._autosave_timer.timeout.connect(self._autosave_candidate)
+
+        # Lettura ritardata del colloquio selezionato nello storico:
+        # scorrendo l'elenco con le frecce non si carica ogni riga
+        # attraversata, ma solo quella su cui ci si ferma.
+        self._history_pending: int | None = None
+        self._history_timer = QTimer(self)
+        self._history_timer.setSingleShot(True)
+        self._history_timer.timeout.connect(self._load_history_detail)
 
         self._refresh_platform()
         self._refresh_history()
@@ -430,14 +461,27 @@ class MainWindow(QMainWindow):
         """Riporta nell'archivio quello che si vede a schermo."""
         if self.current_interview_id is None:
             return
+        firma = (
+            self.candidate_input.text().strip() or "Senza nome",
+            self.role_input.text().strip(),
+            self.notes_edit.toPlainText().strip(),
+            self.experience_input.text().strip(),
+            self.skills_input.text().strip(),
+        )
+        # Il segnale di modifica scatta anche quando il testo torna
+        # identico a prima. Senza questo confronto si riapriva il file
+        # dell'archivio, si riscriveva e si richiudeva per nulla — e su
+        # un disco virtuale ogni scrittura confermata costa parecchio.
+        if firma == self._ultimo_salvato:
+            return
         try:
             db.update_details(
                 self.current_interview_id,
-                candidate_name=self.candidate_input.text().strip() or "Senza nome",
-                role=self.role_input.text().strip(),
-                notes=self.notes_edit.toPlainText().strip(),
-                experience=self.experience_input.text().strip(),
-                skills=self.skills_input.text().strip(),
+                candidate_name=firma[0],
+                role=firma[1],
+                notes=firma[2],
+                experience=firma[3],
+                skills=firma[4],
             )
         except Exception:
             log.exception("Salvataggio automatico dei dati del candidato fallito")
@@ -446,7 +490,32 @@ class MainWindow(QMainWindow):
                 "nell'archivio: controlla i log."
             )
             return
-        self._refresh_history()
+        self._ultimo_salvato = firma
+        self._update_history_entry()
+
+    def _update_history_entry(self) -> None:
+        """
+        Aggiorna la sola riga del colloquio in corso.
+
+        Mentre si scrive il nome del candidato il salvataggio automatico
+        parte ogni volta che ci si ferma un attimo. Rileggere tutto
+        l'archivio a ogni pausa di battitura fermava la finestra, e con
+        essa l'anteprima della videochiamata. Qui si riscrive una riga
+        sola, che e' l'unica che puo' essere cambiata.
+        """
+        if self.current_interview_id is None:
+            return
+        for riga in range(self.history_list.count()):
+            item = self.history_list.item(riga)
+            if item is None or item.data(Qt.UserRole) != self.current_interview_id:
+                continue
+            nome = self.candidate_input.text().strip() or "Senza nome"
+            ruolo = self.role_input.text().strip()
+            # La data resta quella scritta in elenco: e' l'unica parte
+            # della riga che il salvataggio automatico non tocca.
+            data = item.text().split("  —  ", 1)[0]
+            item.setText(f"{data}  —  {nome}" + (f"  ({ruolo})" if ruolo else ""))
+            return
 
     # ==================================================================
     # Scheda "Report"
@@ -687,6 +756,10 @@ class MainWindow(QMainWindow):
     def _refresh_window_list(self, notify: bool = False) -> None:
         current = self.call_view.source.handle if self.call_view.source else None
         windows = list_windows(exclude=int(self.winId()))
+        # Scorrere le finestre aperte e chiedere al sistema il nome di
+        # ogni programma non e' gratis: il risultato si conserva, cosi'
+        # chi sceglie una voce dall'elenco non fa ripetere tutto il giro.
+        self._known_windows = {info.handle: info for info in windows}
 
         self.window_combo.blockSignals(True)
         self.window_combo.clear()
@@ -710,7 +783,10 @@ class MainWindow(QMainWindow):
         self._refresh_window_list()
         if not self.call_view.available:
             return
-        best = best_call_window(exclude=int(self.winId()))
+        # L'elenco appena letto e' gia' ordinato mettendo per prime le
+        # videochiamate: la prima voce buona e' la scelta migliore, e non
+        # serve scorrere di nuovo tutte le finestre del computer.
+        best = self._best_from_known() or best_call_window(exclude=int(self.winId()))
         if best is None:
             return
         if self.call_view.set_source(best):
@@ -719,22 +795,38 @@ class MainWindow(QMainWindow):
                 self.window_combo.setCurrentIndex(index)
             log.info("Anteprima agganciata a '%s'", best.title)
 
+    def _best_from_known(self):
+        """La videochiamata piu' probabile fra le finestre gia' lette."""
+        for info in self._known_windows.values():
+            if info.process in CALL_PROCESSES:
+                return info
+            if info.process in BROWSER_PROCESSES and any(
+                indizio in info.title.lower() for indizio in MEETING_HINTS
+            ):
+                return info
+        return None
+
     def _on_window_selected(self, index: int) -> None:
         handle = self.window_combo.itemData(index)
         if not handle:
             self.call_view.clear()
             return
-        for info in list_windows(exclude=int(self.winId())):
-            if info.handle == handle:
-                if not self.call_view.set_source(info):
-                    QMessageBox.information(
-                        self,
-                        "Anteprima non disponibile",
-                        "Non e' stato possibile agganciare questa finestra. "
-                        "Verifica che non sia ridotta a icona e riprova.",
-                    )
-                return
-        self._refresh_window_list()
+        info = self._known_windows.get(handle)
+        if info is None:
+            # L'elenco e' invecchiato: si rilegge UNA volta sola. Prima
+            # si enumeravano tutte le finestre aperte e poi, se ancora
+            # non si trovava nulla, una seconda volta di fila.
+            self._refresh_window_list()
+            info = self._known_windows.get(handle)
+        if info is None:
+            return
+        if not self.call_view.set_source(info):
+            QMessageBox.information(
+                self,
+                "Anteprima non disponibile",
+                "Non e' stato possibile agganciare questa finestra. "
+                "Verifica che non sia ridotta a icona e riprova.",
+            )
 
     def _on_tab_changed(self, index: int) -> None:
         # La miniatura della videochiamata viene disegnata dal sistema
@@ -751,8 +843,12 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event):  # noqa: N802 - firma imposta da Qt
         super().resizeEvent(event)
-        if hasattr(self, "call_view"):
-            self.call_view.refresh()
+        # Nessuna chiamata a call_view.refresh() qui: ridimensionando la
+        # finestra il riquadro riceve gia' il proprio resizeEvent dal
+        # gestore di disposizione, e chiamarlo anche da qui raddoppiava
+        # le richieste al sistema per ogni pixel di trascinamento.
+        # Sullo spostamento invece serve, perche' il riquadro non si
+        # muove rispetto alla finestra che lo contiene.
 
     # ==================================================================
     # Preparazione all'avvio
@@ -882,6 +978,13 @@ class MainWindow(QMainWindow):
         self.warning_label.setVisible(False)
         self.echo_chip.setVisible(False)
         self.current_interview_id = None
+        # Vanno azzerati con il colloquio: la firma del salvataggio
+        # automatico appartiene al candidato precedente, e riportare i
+        # suoi dati su quello nuovo verrebbe scambiato per "nulla e'
+        # cambiato" e non salvato. Il conteggio delle frasi nascoste,
+        # allo stesso modo, non deve trascinarsi dal colloquio prima.
+        self._ultimo_salvato = None
+        self._segmenti_nascosti = 0
         self.export_docx_button.setEnabled(False)
         self.export_txt_button.setEnabled(False)
         self.report_button.setEnabled(False)
@@ -1043,6 +1146,12 @@ class MainWindow(QMainWindow):
         )
         try:
             self.current_interview_id = db.save_interview(interview)
+            # Cio' che e' appena finito nell'archivio e' anche cio' che
+            # il salvataggio automatico non deve riscrivere subito dopo.
+            self._ultimo_salvato = (
+                interview.candidate_name, interview.role, interview.notes,
+                interview.experience, interview.skills,
+            )
             self._refresh_history()
             self.export_docx_button.setEnabled(True)
             self.export_txt_button.setEnabled(True)
@@ -1138,7 +1247,6 @@ class MainWindow(QMainWindow):
         if self.current_interview_id is not None:
             try:
                 db.update_report(self.current_interview_id, result.text, result.used_llm)
-                self._refresh_history()
             except Exception:
                 salvato = False
                 log.exception("Aggiornamento del report non riuscito")
@@ -1191,7 +1299,6 @@ class MainWindow(QMainWindow):
         if self.current_interview_id is not None:
             try:
                 db.update_report(self.current_interview_id, "", False)
-                self._refresh_history()
             except Exception:
                 log.exception("Cancellazione del report non riuscita")
                 self._add_warning(
@@ -1228,12 +1335,24 @@ class MainWindow(QMainWindow):
 
     def _on_segment(self, segment: dict) -> None:
         if not self.captions_button.isChecked():
+            # Le frasi arrivate a sottotitoli nascosti venivano
+            # semplicemente buttate: riaccendendoli restava un buco
+            # permanente in mezzo alla trascrizione a schermo, senza
+            # nulla che lo segnalasse. Ed e' proprio il pulsante che si
+            # prova a premere quando la finestra va a scatti.
+            self._segmenti_nascosti += 1
             return
         speaker = segment.get("speaker", "")
         label = self._labels().get(speaker, speaker)
         color = theme.SPEAKER_COLORS.get(speaker, theme.TEXT)
         stamp = datetime.now().strftime("%H:%M")
         text = html.escape(segment.get("text", ""))
+
+        scrollbar = self.transcript_view.verticalScrollBar()
+        # Chi ha scorso indietro per rileggere una risposta non va
+        # riportato in fondo a forza a ogni frase nuova: prima era
+        # impossibile rileggere qualcosa mentre il colloquio proseguiva.
+        era_in_fondo = scrollbar.value() >= scrollbar.maximum() - 4
 
         cursor = self.transcript_view.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
@@ -1244,8 +1363,36 @@ class MainWindow(QMainWindow):
             f'<br><span style="color:{theme.TEXT}">{text}</span>'
             f"</div><br>"
         )
-        scrollbar = self.transcript_view.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        self._trim_transcript_view()
+        if era_in_fondo:
+            scrollbar.setValue(scrollbar.maximum())
+
+    def _trim_transcript_view(self) -> None:
+        """
+        Tiene a schermo solo le battute recenti.
+
+        Il colloquio dura ore, il riquadro ne mostra una trentina di
+        righe. Tenere in vita tutto il resto non costa nulla mentre si
+        scrive, ma costa carissimo quando Qt deve ricalcolare la
+        disposizione dell'intero documento — e lo fa a OGNI evento di
+        ridimensionamento, che Windows manda a decine al secondo mentre
+        si trascina il bordo della finestra. Con tremila interventi in
+        memoria erano oltre cento millisecondi di finestra ferma per
+        ciascuno di quegli eventi, ed e' nello stesso momento che si
+        riallinea l'anteprima della videochiamata.
+
+        Nulla va perduto: il report e l'archivio leggono dal motore di
+        trascrizione, non da questo riquadro.
+        """
+        documento = self.transcript_view.document()
+        eccesso = documento.blockCount() - MAX_BLOCCHI_TRASCRIZIONE
+        if eccesso <= 0:
+            return
+        taglio = QTextCursor(documento.firstBlock())
+        taglio.movePosition(
+            QTextCursor.NextBlock, QTextCursor.KeepAnchor, eccesso
+        )
+        taglio.removeSelectedText()
 
     def _on_level(self, speaker: str, level: float) -> None:
         meter = self.level_meters.get(speaker)
@@ -1289,8 +1436,11 @@ class MainWindow(QMainWindow):
                 self.echo_chip.setText("Altoparlanti rilevati — eco gestita")
                 self.echo_chip.setVisible(True)
 
-            arretrato = self.session.pending_chunks
-            if arretrato >= 4:
+            # Secondi di parlato arretrato, non numero di elementi: il
+            # canale del candidato produce due avvisi di silenzio al
+            # secondo, che non valgono nulla ma facevano scattare
+            # l'avviso entro i primi due secondi di ogni colloquio.
+            if self.session.pending_seconds >= 20.0:
                 self._add_warning(
                     "La trascrizione non sta al passo del parlato: nelle "
                     "impostazioni puoi scegliere un modello piu' leggero."
@@ -1322,32 +1472,66 @@ class MainWindow(QMainWindow):
         )
 
     def _refresh_skill_chips(self, text: str) -> None:
-        while self.skills_row.count() > 1:
-            item = self.skills_row.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
+        """
+        Aggiorna i riquadri delle competenze RIUSANDOLI.
+
+        Prima venivano distrutti e ricreati da capo a ogni tasto premuto:
+        ogni riquadro nuovo obbliga Qt a ricalcolargli addosso l'intero
+        foglio di stile, ed erano una decina di millisecondi di finestra
+        ferma per ciascuna lettera digitata — tipicamente mentre si sta
+        parlando con il candidato.
+        """
         # La colonna del candidato e' la piu' stretta: allineati su una
-        # riga sola, i riquadri delle competenze venivano tagliati a
-        # meta' parola, senza puntini e senza suggerimento. Ne mostriamo
-        # meno, accorciamo quelli lunghi e il testo intero resta
-        # leggibile passandoci sopra il puntatore.
+        # riga sola, i riquadri venivano tagliati a meta' parola, senza
+        # puntini e senza suggerimento. Ne mostriamo meno, accorciamo
+        # quelli lunghi e il testo intero resta leggibile passandoci
+        # sopra il puntatore.
         competenze = [s.strip() for s in text.split(",") if s.strip()][:4]
-        for skill in competenze:
-            etichetta = skill if len(skill) <= 14 else skill[:13] + "…"
-            chip = Chip(etichetta, "SkillChip")
-            chip.setToolTip(skill)
+        riquadri = self._skill_chips
+        while len(riquadri) < len(competenze):
+            chip = Chip("", "SkillChip")
             self.skills_row.insertWidget(self.skills_row.count() - 1, chip)
+            riquadri.append(chip)
+        for chip, skill in zip(riquadri, competenze):
+            etichetta = skill if len(skill) <= 14 else skill[:13] + "…"
+            if chip.text() != etichetta:
+                chip.setText(etichetta)
+                chip.setToolTip(skill)
+            chip.setVisible(True)
+        for chip in riquadri[len(competenze):]:
+            chip.setVisible(False)
 
     def _toggle_captions(self, enabled: bool) -> None:
         self.captions_button.setText(
             "Sottotitoli live: attivi" if enabled else "Sottotitoli live: nascosti"
         )
         if not enabled:
+            self._segmenti_nascosti = 0
+            # Il testo segnaposto si vede solo a riquadro vuoto: con una
+            # trascrizione gia' a schermo l'utente non riceveva alcuna
+            # conferma di cio' che aveva appena spento.
             self.transcript_view.setPlaceholderText(
                 "Sottotitoli nascosti. La registrazione e la trascrizione "
                 "proseguono: utile mentre condividi lo schermo."
             )
+            self.status_label.setText(
+                "Sottotitoli nascosti. La registrazione e la trascrizione "
+                "proseguono normalmente."
+            )
+            return
+        if self._segmenti_nascosti:
+            cursor = self.transcript_view.textCursor()
+            cursor.movePosition(cursor.MoveOperation.End)
+            cursor.insertHtml(
+                f'<div style="margin-bottom:10px">'
+                f'<span style="color:{theme.TEXT_MUTED};font-size:11px">'
+                f"— {self._segmenti_nascosti} interventi non mostrati "
+                f"mentre i sottotitoli erano nascosti "
+                f"(restano nel report e nell'archivio) —"
+                f"</span></div><br>"
+            )
+            self._segmenti_nascosti = 0
+            self._trim_transcript_view()
 
     def _apply_always_on_top(self, enabled: bool) -> None:
         settings.set("always_on_top", bool(enabled))
@@ -1423,6 +1607,12 @@ class MainWindow(QMainWindow):
         self._write_export(interview, fmt)
 
     def _write_export(self, interview, fmt: str) -> None:
+        # Scrivere il documento Word di un colloquio lungo significa
+        # creare oltre mille paragrafi: mezzo secondo su un computer
+        # normale, qualche secondo su una macchina virtuale, con la
+        # finestra ferma e nessuna spiegazione. Almeno il puntatore lo
+        # dice.
+        QGuiApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             if fmt == "docx":
                 path = export_docx(interview, self._labels())
@@ -1430,10 +1620,16 @@ class MainWindow(QMainWindow):
                 path = export_txt(interview, self._labels())
         except Exception as exc:
             log.exception("Esportazione non riuscita")
+            QGuiApplication.restoreOverrideCursor()
             QMessageBox.warning(
                 self, "Esportazione non riuscita", f"Non e' stato possibile salvare: {exc}"
             )
             return
+        finally:
+            # Il puntatore va restituito comunque: lasciarlo a clessidra
+            # farebbe sembrare bloccato un programma che non lo e'.
+            if QGuiApplication.overrideCursor() is not None:
+                QGuiApplication.restoreOverrideCursor()
 
         answer = QMessageBox.question(
             self,
@@ -1447,7 +1643,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_history(self) -> None:
         try:
-            colloqui = db.list_interviews()
+            colloqui = db.list_interview_headers()
         except Exception:
             log.exception("Lettura dell'archivio non riuscita")
             self._add_warning("L'archivio dei colloqui non e' leggibile.")
@@ -1473,11 +1669,28 @@ class MainWindow(QMainWindow):
             return None
 
     def _show_history_item(self, current, _previous=None) -> None:
-        if current is None:
+        """
+        Mostra il colloquio selezionato, ma non subito.
+
+        Scorrendo l'elenco con le frecce si attraversano decine di
+        righe: caricando ogni colloquio attraversato si leggeva
+        dall'archivio la trascrizione integrale, la si riscriveva a
+        schermo e si fermava la finestra a ogni pressione del tasto.
+        Si carica solo quello su cui ci si ferma davvero.
+        """
+        self._history_pending = current.data(Qt.UserRole) if current else None
+        if self._history_pending is None:
+            self._history_timer.stop()
+            self.history_detail.clear()
+            return
+        self._history_timer.start(150)
+
+    def _load_history_detail(self) -> None:
+        if self._history_pending is None:
             self.history_detail.clear()
             return
         try:
-            interview = db.get_interview(current.data(Qt.UserRole))
+            interview = db.get_interview(self._history_pending)
         except Exception:
             log.exception("Lettura del colloquio non riuscita")
             self.history_detail.setPlainText(
@@ -1562,6 +1775,7 @@ class MainWindow(QMainWindow):
             # agiscono su di esso restavano accesi e, premuti, non
             # facevano nulla senza dire perche'.
             self.current_interview_id = None
+            self._ultimo_salvato = None
             self._autosave_timer.stop()
             self.export_docx_button.setEnabled(False)
             self.export_txt_button.setEnabled(False)
