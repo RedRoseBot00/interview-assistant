@@ -71,6 +71,31 @@ class Interview:
             return self.created_at
 
 
+@dataclass
+class InterviewHeader:
+    """
+    Solo quello che serve per una riga dell'elenco.
+
+    L'elenco dell'archivio mostra data, nome e ruolo. Leggere anche la
+    trascrizione e i segmenti di ogni colloquio significa portare in
+    memoria svariati megabyte di testo per disegnare due righe: con
+    qualche decina di colloqui in archivio la finestra restava ferma
+    per secondi ogni volta che si aggiornava l'elenco.
+    """
+
+    id: Optional[int]
+    candidate_name: str
+    role: str = ""
+    created_at: str = ""
+
+    @property
+    def display_date(self) -> str:
+        try:
+            return datetime.fromisoformat(self.created_at).strftime("%d/%m/%Y %H:%M")
+        except Exception:
+            return self.created_at
+
+
 @contextmanager
 def _connect():
     conn = sqlite3.connect(str(config.DB_PATH), timeout=15)
@@ -133,7 +158,15 @@ def _row_to_interview(row: sqlite3.Row) -> Interview:
             if isinstance(parsed, list):
                 segments = parsed
         except Exception:
-            log.debug("Segmenti non leggibili per il colloquio %s", data.get("id"))
+            # Il colloquio si apre lo stesso e sembra integro, ma senza
+            # l'attribuzione delle battute: chi rigenerasse il report
+            # lavorerebbe su dati mutilati. A livello "debug" non lo
+            # sapeva nessuno.
+            log.warning(
+                "Segmenti non leggibili per il colloquio %s: resta la "
+                "trascrizione, si perde l'attribuzione delle battute",
+                data.get("id"), exc_info=True,
+            )
 
     # SQLite non impone il tipo delle colonne: un valore inatteso non
     # deve far sparire l'intero elenco dei colloqui.
@@ -259,6 +292,44 @@ def update_details(
             )
 
     _with_recovery(_operation)
+
+
+def list_interview_headers(limit: int = 500) -> list[InterviewHeader]:
+    """
+    L'elenco dell'archivio, senza il testo dei colloqui.
+
+    Si chiedono al database soltanto le quattro colonne che finiscono
+    davvero sullo schermo. Il testo integrale viene letto solo quando
+    si apre un colloquio, cioe' una riga alla volta.
+    """
+    init_db()
+
+    def _operation() -> list[InterviewHeader]:
+        with _connect() as conn:
+            rows = conn.execute(
+                "SELECT id, candidate_name, role, created_at FROM interviews "
+                "ORDER BY datetime(created_at) DESC, id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+
+        elenco = []
+        for row in rows:
+            # Una riga illeggibile non deve nascondere tutte le altre.
+            try:
+                dati = dict(row)
+                elenco.append(
+                    InterviewHeader(
+                        id=dati.get("id"),
+                        candidate_name=str(dati.get("candidate_name") or ""),
+                        role=str(dati.get("role") or ""),
+                        created_at=str(dati.get("created_at") or ""),
+                    )
+                )
+            except Exception:
+                log.warning("Colloquio non leggibile, lo salto", exc_info=True)
+        return elenco
+
+    return _with_recovery(_operation)
 
 
 def list_interviews(limit: int = 500) -> list[Interview]:
