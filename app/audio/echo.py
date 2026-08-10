@@ -461,8 +461,19 @@ class EchoProcessor:
             # rumore che falserebbe il confronto.
             return x[:usable].reshape(-1, passo).mean(axis=1).astype(np.float32)
 
+        # Anche il controllo rapido deve guardare all'indietro. Senza
+        # questo margine il probe trovava solo gli echi in ritardo
+        # positivo: bastava che le due basi tempi avessero derivato di
+        # pochi millesimi perche' l'eco risultasse invisibile, il
+        # processore non si risvegliasse piu' e ogni domanda comparisse
+        # due volte per il resto del colloquio. E' lo stesso margine
+        # usato nell'analisi completa, ridotto nella stessa proporzione.
         correlation, _lag, _prom = _normalised_cross_correlation(
-            riduci(mic), riduci(reference), pre_samples // passo, None
+            riduci(mic),
+            riduci(reference),
+            pre_samples // passo,
+            max_lag_samples=None,
+            max_lead_samples=int(FORWARD_MARGIN_SECONDS * self.sample_rate) // passo,
         )
         return correlation >= PROBE_CORRELATION
 
@@ -484,17 +495,25 @@ class EchoProcessor:
         if not self.enabled or reference is None or reference.size == 0:
             return EchoResult(mic, False, 0.0, 0.0)
 
+        reference_active = (
+            float(np.sqrt(np.mean(np.square(reference, dtype=np.float64))))
+            >= REFERENCE_ACTIVE_RMS
+        )
+        # Se il candidato taceva non c'e' nulla che possa aver fatto eco:
+        # la ricerca completa lavorerebbe su un segnale vuoto per non
+        # trovare niente. E' il caso piu' frequente di tutti — accade
+        # ogni volta che il selezionatore parla da solo — e costa da sei
+        # a oltre cento millisecondi di trasformata per frase, tempo
+        # sottratto ai sottotitoli e all'anteprima della videochiamata.
+        if not reference_active:
+            return EchoResult(mic, False, 0.0, 0.0)
+
         # Analisi ridotta (cuffie): l'esame completo su una frase lunga
         # costa quanto un decimo della trascrizione, e ripeterlo per
         # tutto il colloquio senza mai trovare nulla e' tempo tolto ai
         # sottotitoli.
         if self._sleeping and not self._probably_echoing(mic, reference, pre_samples):
             return EchoResult(mic, False, 0.0, 0.0)
-
-        reference_active = (
-            float(np.sqrt(np.mean(np.square(reference, dtype=np.float64))))
-            >= REFERENCE_ACTIVE_RMS
-        )
 
         self.processed += 1
         # Il ritardo dell'eco non puo' superare i limiti fisici: cercare

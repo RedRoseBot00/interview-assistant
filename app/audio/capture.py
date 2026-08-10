@@ -72,6 +72,10 @@ MAX_CONSECUTIVE_READ_ERRORS = 60
 # arrivavano minuti dopo la voce: era questa, e non il riconoscimento
 # vocale in se', la causa principale della lentezza percepita.
 MAX_BACKLOG_SECONDS = 25.0
+# Spazio che resta comunque alla coda anche quando la trascrizione tiene
+# gia' da parte molto audio. Senza questo minimo il limite qui sopra
+# poteva risultare irraggiungibile e la coda veniva svuotata per intero.
+QUEUE_FLOOR_SECONDS = 10.0
 # Limite di sicurezza sul numero di elementi, per non far crescere la
 # memoria senza fine se il motore si ferma del tutto.
 QUEUE_HARD_LIMIT = 512
@@ -161,6 +165,49 @@ class AudioQueue(queue.Queue):
             0.0, self._queued_seconds - self._samples(item) / self._sample_rate
         )
         return item
+
+    def trim_to(self, max_seconds: float) -> int:
+        """
+        Scarta il parlato piu' vecchio finche' l'attesa rientra nel limite.
+
+        Due accortezze, entrambe imparate da guasti veri.
+
+        La prima: gli avvisi di silenzio durano zero secondi per
+        definizione, quindi buttarli via non abbrevia l'attesa di un solo
+        millisecondo, mentre toglie all'altro canale il riferimento con
+        cui riconosce l'eco e alla trascrizione il segno di dove sia
+        arrivata l'analisi. Qui restano al loro posto, in testa e
+        nell'ordine originale.
+
+        La seconda: si scarta solo finche' il conteggio scende davvero.
+        Il ciclo si ferma quando non c'e' piu' parlato da togliere,
+        quindi non puo' svuotare la coda a vuoto.
+        """
+        scartati = 0
+        with self.mutex:
+            trattenuti = []
+            while self.queue and self._queued_seconds > max_seconds:
+                elemento = self.queue.popleft()
+                durata = self._samples(elemento) / self._sample_rate
+                if durata <= 0.0:
+                    trattenuti.append(elemento)
+                    continue
+                self._queued_seconds = max(0.0, self._queued_seconds - durata)
+                scartati += 1
+            for elemento in reversed(trattenuti):
+                self.queue.appendleft(elemento)
+            if scartati:
+                # Chi fosse in attesa di spazio puo' procedere.
+                self.not_full.notify(scartati)
+                # Gli elementi tolti qui non passeranno mai da get(), e
+                # quindi nessuno chiamera' task_done() per loro: senza
+                # questo aggiustamento un eventuale join() sulla coda non
+                # tornerebbe mai piu'.
+                self.unfinished_tasks -= scartati
+                if self.unfinished_tasks <= 0:
+                    self.unfinished_tasks = 0
+                    self.all_tasks_done.notify_all()
+        return scartati
 
 
 # --------------------------------------------------------------------------
@@ -279,7 +326,16 @@ def _antialias_kernel(source_rate: int, target_rate: int) -> np.ndarray:
 def _convolve_same(signal: np.ndarray, kernel: np.ndarray) -> np.ndarray:
     """Convoluzione centrata, passando per la FFT sui segnali lunghi."""
     if signal.size < 4096:
-        return np.convolve(signal, kernel, mode="same").astype(np.float32)
+        if signal.size >= kernel.size:
+            return np.convolve(signal, kernel, mode="same").astype(np.float32)
+        # Con un segnale piu' corto del filtro, la modalita' "same" di
+        # np.convolve centra il risultato sul FILTRO e non sul segnale:
+        # i campioni restituiti sono quelli sbagliati. Oggi non ci si
+        # arriva mai (le frasi durano almeno un decimo di secondo), ma e'
+        # una trappola per chiunque riusi questa funzione altrove.
+        inizio = (kernel.size - 1) // 2
+        pieno = np.convolve(signal, kernel, mode="full")
+        return pieno[inizio : inizio + signal.size].astype(np.float32)
 
     size = 1
     needed = signal.size + kernel.size - 1
@@ -486,7 +542,14 @@ class _SourceReader(threading.Thread):
         self.device = device
         self.speaker = speaker
         self._output = output
-        self._stop = stop_event
+        # Il nome NON puo' essere "_stop": threading.Thread usa gia' un
+        # metodo interno con quel nome, chiamato da join() e is_alive()
+        # non appena il thread e' finito. Coprendolo con un oggetto
+        # evento, ogni arresto della registrazione moriva con un
+        # "'Event' object is not callable": il secondo dispositivo non
+        # veniva mai chiuso, PortAudio restava aperto a ogni colloquio e
+        # gli avvisi veri venivano sostituiti da quell'errore assurdo.
+        self._stop_event = stop_event
         self._started_at = started_at
         self._on_level = on_level
         self._on_error = on_error
@@ -529,23 +592,27 @@ class _SourceReader(threading.Thread):
         )
         duration = samples.size / float(config.AUDIO_SAMPLE_RATE)
 
-        # Il numero di giri e' limitato invece di confrontare il
-        # contatore prima e dopo. Il confronto sembrava prudente ma si
-        # fermava al primo marcatore di silenzio incontrato — che dura
-        # zero secondi per definizione — e cosi' il limite sull'arretrato
-        # non scartava mai nulla: la coda cresceva indisturbata e i
-        # sottotitoli accumulavano minuti di ritardo senza alcun avviso.
-        for _ in range(QUEUE_HARD_LIMIT):
-            if getattr(self._output, "pending_seconds", 0.0) + duration <= (
-                MAX_BACKLOG_SECONDS
-            ):
-                break
-            try:
-                stale = self._output.get_nowait()
-            except queue.Empty:
-                break
-            if getattr(stale.samples, "size", 0):
-                self.dropped_chunks += 1
+        # L'audio che la trascrizione tiene gia' in mano restringe lo
+        # spazio concesso alla coda, ma non oltre un minimo garantito.
+        # Contarlo senza quel minimo era un guasto silenzioso e grave:
+        # quando il motore ne teneva da parte piu' del limite, nessuna
+        # quantita' di scarti poteva far scendere il totale, e a ogni
+        # frase la coda veniva svuotata per intero — parlato compreso —
+        # senza che il limite risultasse mai rispettato.
+        # Il minimo va applicato DOPO aver sottratto la frase in arrivo,
+        # altrimenti si perde di nuovo. Una risposta lunga viene tagliata
+        # dal rilevatore di voce a dieci secondi esatti, cioe' quanto il
+        # minimo: sottraendola per ultima il limite scendeva a zero e
+        # l'intera coda spariva — proprio sulle risposte piu' lunghe, che
+        # sono quelle che contano.
+        parcheggiati = getattr(self._output, "parked_seconds", 0.0)
+        limite = max(
+            QUEUE_FLOOR_SECONDS,
+            MAX_BACKLOG_SECONDS - parcheggiati - duration,
+        )
+        trim = getattr(self._output, "trim_to", None)
+        if trim is not None:
+            self.dropped_chunks += trim(limite)
 
         try:
             self._output.put_nowait(chunk)
@@ -614,7 +681,7 @@ class _SourceReader(threading.Thread):
                 self.device.channels,
             )
 
-            while not self._stop.is_set():
+            while not self._stop_event.is_set():
                 try:
                     raw = stream.read(READ_FRAMES, exception_on_overflow=False)
                     consecutive_errors = 0
@@ -653,8 +720,14 @@ class _SourceReader(threading.Thread):
             try:
                 for utterance in self._segmenter.flush():
                     self._emit(utterance)
-            except Exception:
-                log.debug("Ultima frase non recuperata", exc_info=True)
+            except Exception as exc:
+                # Qui esce l'ultima risposta del candidato: se si perde,
+                # sparisce dal report senza lasciare traccia. A livello
+                # "debug" non compariva nemmeno nei log.
+                log.exception("Ultima frase della sorgente '%s' non recuperata",
+                              self.speaker)
+                if self._on_error:
+                    self._on_error(self.speaker, exc)
 
             log.info(
                 "Sorgente '%s': parlato rilevato sul %.0f%% del tempo",
@@ -667,7 +740,14 @@ class _SourceReader(threading.Thread):
                         try:
                             action()
                         except Exception:
-                            pass
+                            # Se la chiusura fallisce il dispositivo
+                            # resta occupato, e al colloquio successivo
+                            # l'utente legge "in uso da un altro
+                            # programma" senza il minimo indizio nei log.
+                            log.warning(
+                                "Chiusura dello stream '%s' non riuscita",
+                                self.speaker, exc_info=True,
+                            )
             log.info(
                 "Sorgente '%s' terminata (blocchi scartati: %d)",
                 self.speaker,
