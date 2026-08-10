@@ -293,23 +293,43 @@ def whisper_model_dir(size: str) -> Path:
     return config.WHISPER_CACHE_DIR / f"faster-whisper-{size}"
 
 
-def _file_ok(path: Path) -> bool:
-    return path.exists() and path.stat().st_size > 0
+def _file_ok(path: Path, min_bytes: int = 1) -> bool:
+    try:
+        return path.exists() and path.stat().st_size >= min_bytes
+    except OSError:
+        return False
+
+
+# Dimensione minima plausibile di model.bin per ciascun modello: circa
+# l'ottanta per cento di quella vera. "Esiste ed e' piu' grande di
+# zero" non bastava: un download troncato dall'antivirus o da un
+# riavvio superava il controllo, il programma dichiarava il modello
+# presente, e il caricamento esplodeva a colloquio gia' avviato — con
+# la registrazione che proseguiva senza che nessuno trascrivesse.
+_MODEL_BIN_MIN_BYTES = {
+    "tiny": 60_000_000,
+    "base": 110_000_000,
+    "small": 380_000_000,
+    "medium": 1_200_000_000,
+}
 
 
 def whisper_model_present(size: str) -> bool:
     """
     Il modello e' completo e utilizzabile.
 
-    Il controllo comprende il vocabolario: un'installazione priva di
-    quel file supera un controllo superficiale ma poi fa fallire ogni
-    colloquio, ed e' quindi peggio di un modello assente, perche' non
-    verrebbe mai riparata da sola.
+    Il controllo comprende il vocabolario e la DIMENSIONE del file dei
+    pesi: un'installazione troncata supera un controllo superficiale ma
+    poi fa fallire ogni colloquio, ed e' quindi peggio di un modello
+    assente, perche' non verrebbe mai riparata da sola.
     """
     directory = whisper_model_dir(size)
     if not directory.is_dir():
         return False
     if not all(_file_ok(directory / name) for name in _WHISPER_FILES_REQUIRED):
+        return False
+    if not _file_ok(directory / "model.bin",
+                    _MODEL_BIN_MIN_BYTES.get(size, 1)):
         return False
     return any(_file_ok(directory / name) for name in _WHISPER_FILES_VOCABULARY)
 
