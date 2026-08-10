@@ -119,6 +119,10 @@ ENCODER_WINDOW_MIN = 10
 # d'emergenza, qualunque cosa dica il carico stimato.
 DROP_ALARM_SECONDS = 3.0
 
+# Pausa fra due tentativi di ricaricare un modello dopo un cambio
+# fallito del tutto: martellare un disco gia' in difficolta' peggiora.
+MODEL_RETRY_SECONDS = 20.0
+
 # Ogni quante frasi lunghe si lascia il modello libero di ridire la sua
 # sulla lingua, per potersi ricredere su un blocco iniziale sbagliato.
 LANGUAGE_PROBE_EVERY = 8
@@ -371,6 +375,8 @@ class TranscriptionEngine:
         # Secondi di parlato gia' visti scartare dalla coda: serve a
         # reagire solo agli scarti NUOVI.
         self._dropped_seen = 0.0
+        # Ultimo tentativo di ricaricare un modello mancante.
+        self._model_retry_at = 0.0
         self.merged_utterances = 0
 
         # Conteggi aggiornati man mano. Ricalcolarli ogni secondo
@@ -416,6 +422,33 @@ class TranscriptionEngine:
         # con quale precisione. Senza, un computer che gira con un solo
         # thread o con i kernel generici e' indistinguibile da uno che
         # gira come dovrebbe.
+        # Il costo per chiamata misurato dal controllo d'avvio semina le
+        # stime del motore: cosi' l'accorpamento e il declassamento sanno
+        # da SUBITO con che computer hanno a che fare, invece di scoprirlo
+        # dopo otto chiamate — cioe' a meta' della prima risposta lunga.
+        try:
+            from app import diagnostics, settings as _settings
+
+            misurato = float(_settings.get("engine_speed_seconds", 0.0) or 0.0)
+            riferito = _settings.get("engine_selftest_size", "") or self.model_size
+            if (
+                misurato > 0
+                and self._call_cost <= 0
+                and riferito in diagnostics.COSTI_RELATIVI
+                and self.model_size in diagnostics.COSTI_RELATIVI
+            ):
+                self._call_cost = misurato * (
+                    diagnostics.COSTI_RELATIVI[self.model_size]
+                    / diagnostics.COSTI_RELATIVI[riferito]
+                )
+                self._speed_samples = 3
+                log.info(
+                    "Costo per chiamata seminato dalla taratura: %.1f s",
+                    self._call_cost,
+                )
+        except Exception:
+            log.debug("Taratura non seminabile", exc_info=True)
+
         interno = getattr(self._model, "model", None)
         log.info(
             "Modello '%s' caricato in %.1f s — %d thread "
@@ -520,8 +553,11 @@ class TranscriptionEngine:
             return
         try:
             avviso(message)
-        except RuntimeError:
-            self.detach_callbacks()
+        except RuntimeError as exc:
+            if "already deleted" in str(exc).lower():
+                self.detach_callbacks()
+            else:
+                log.debug("Notifica di stato fallita", exc_info=True)
         except Exception:
             log.debug("Notifica di stato fallita", exc_info=True)
 
@@ -539,8 +575,11 @@ class TranscriptionEngine:
             return
         try:
             segnala(exc)
-        except RuntimeError:
-            self.detach_callbacks()
+        except RuntimeError as errore:
+            if "already deleted" in str(errore).lower():
+                self.detach_callbacks()
+            else:
+                log.debug("Segnalazione dell'errore non riuscita", exc_info=True)
         except Exception:
             log.debug("Segnalazione dell'errore non riuscita", exc_info=True)
 
@@ -585,10 +624,46 @@ class TranscriptionEngine:
         except Exception as exc:
             log.exception("Caricamento del modello non riuscito")
             self._notify_error(exc)
-            # Svuotiamo comunque la coda: senza consumatore i thread
-            # audio la riempirebbero fino a scartare blocchi a vuoto.
-            self._drain(audio_queue)
-            return
+            # Il thread NON esce piu'. Prima usciva, e questo era il
+            # guasto peggiore del programma: la registrazione proseguiva
+            # con tutte le spie accese — timer, indicatori del volume,
+            # pulsante "Termina" — ma nessuno stava trascrivendo. Zero
+            # sottotitoli per tutto il colloquio, report vuoto alla fine,
+            # e come unico indizio una riga di avviso facile da non
+            # vedere. Un file del modello troncato dall'antivirus o un
+            # aggiornamento a meta' bastavano a produrlo.
+            #
+            # Ora si prova la scala dei ripieghi presenti sul disco —
+            # 'tiny' viene scaricato come riserva proprio per questo —
+            # e, se nemmeno quelli si caricano, si resta in ascolto:
+            # _transcribe ritentera' il caricamento a intervalli.
+            from app.models.download import whisper_model_present
+
+            try:
+                posizione = MODEL_LADDER.index(self.model_size)
+            except ValueError:
+                posizione = -1
+            for ripiego in MODEL_LADDER[posizione + 1:]:
+                if not whisper_model_present(ripiego):
+                    continue
+                try:
+                    self.model_size = ripiego
+                    self.load_model()
+                    self.model_changed_to = ripiego
+                    self._notify_status(
+                        f"Il modello selezionato non si carica: uso "
+                        f"'{ripiego}' come riserva per questo colloquio."
+                    )
+                    break
+                except Exception:
+                    log.exception("Anche il ripiego '%s' non si carica", ripiego)
+                    self._model = None
+            if self._model is None:
+                self._notify_status(
+                    "La trascrizione non riesce a partire: il modello non "
+                    "si carica. Continuo a riprovare — controlla lo spazio "
+                    "sul disco e l'antivirus."
+                )
 
         scadenza_arresto: Optional[float] = None
         while True:
@@ -992,8 +1067,33 @@ class TranscriptionEngine:
     # Trascrizione vera e propria
     # ------------------------------------------------------------------
     def _transcribe(self, chunk: AudioChunk) -> None:
-        if chunk.samples.size == 0 or self._model is None:
+        if chunk.samples.size == 0:
             return
+        if self._model is None:
+            # Rete di sicurezza estrema: se un cambio di modello e'
+            # fallito COMPLETAMENTE (nuovo non caricabile E vecchio non
+            # ricaricabile — disco pieno, memoria esaurita), il motore
+            # restava vivo ma senza modello, e scartava in silenzio ogni
+            # frase fino a fine colloquio: sottotitoli morti, report
+            # vuoto, nessun errore. Qui si riprova a caricare, con una
+            # pausa fra i tentativi per non martellare un disco in
+            # difficolta'.
+            adesso = time.monotonic()
+            if adesso - self._model_retry_at < MODEL_RETRY_SECONDS:
+                return
+            self._model_retry_at = adesso
+            try:
+                self.load_model()
+                if self._model is None:
+                    return
+                log.warning("Modello ricaricato dopo un cambio fallito")
+            except Exception:
+                log.exception("Motore ancora senza modello: riprovero'")
+                self._notify_status(
+                    "La trascrizione e' momentaneamente interrotta: "
+                    "il modello non riesce a caricarsi. Riprovo..."
+                )
+                return
 
         # Il trattamento del segnale viene PRIMA del controllo di
         # silenzio. Nell'ordine inverso, il guadagno pensato per i
@@ -1164,12 +1264,19 @@ class TranscriptionEngine:
         if consegna is not None:
             try:
                 consegna(segment)
-            except RuntimeError:
-                log.info(
-                    "Interfaccia non piu' disponibile: proseguo senza mostrare "
-                    "le frasi a schermo"
-                )
-                self.detach_callbacks()
+            except RuntimeError as exc:
+                # Ci si sgancia SOLO se l'interfaccia e' stata distrutta:
+                # per qualunque altro errore — compreso un RecursionError,
+                # che e' sottoclasse di RuntimeError — si va avanti,
+                # perche' lo sgancio e' per sempre.
+                if "already deleted" in str(exc).lower():
+                    log.info(
+                        "Interfaccia non piu' disponibile: proseguo senza "
+                        "mostrare le frasi a schermo"
+                    )
+                    self.detach_callbacks()
+                else:
+                    log.exception("Consegna di una frase non riuscita")
             except Exception:
                 log.exception("Consegna di una frase all'interfaccia non riuscita")
 
@@ -1615,8 +1722,20 @@ class TranscriptionEngine:
             log.exception(
                 "Caricamento di '%s' fallito: ricarico '%s'", nuovo, vecchio
             )
-            self._model = _carica(vecchio)
-            self.model_size = vecchio
+            try:
+                self._model = _carica(vecchio)
+                self.model_size = vecchio
+            except Exception:
+                # Nemmeno il vecchio si ricarica: il motore e' senza
+                # modello. Non e' piu' una condanna — _transcribe se ne
+                # accorge e riprova a caricare da solo — ma va scritto
+                # chiaro nel log, perche' da fuori si vede solo silenzio.
+                log.exception(
+                    "Anche il ripristino di '%s' e' fallito: il motore "
+                    "restera' muto finche' un caricamento non riesce",
+                    vecchio,
+                )
+                self.model_size = vecchio
             raise
 
         self.model_changed_to = nuovo
