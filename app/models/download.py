@@ -34,9 +34,20 @@ log = logging.getLogger(__name__)
 DOWNLOAD_ATTEMPTS = 4
 RETRY_BACKOFF_SECONDS = (3, 8, 20)
 
-# Spazio richiesto prima di cominciare: modello per i report (~2,0 GB) +
-# modello di trascrizione + margine per il file temporaneo.
-REQUIRED_FREE_BYTES = 4_000_000_000
+# Spazio richiesto prima di cominciare, per modello. Prima era un'unica
+# cifra da quattro gigabyte pretesa appena mancava qualcosa: chi aveva
+# gia' il modello di trascrizione e doveva scaricare solo quello del
+# report — due gigabyte —
+# veniva bloccato pur avendone tre liberi, cosa ordinaria su un disco
+# virtuale. Il file parziale viene rinominato, non copiato, quindi non
+# serve il doppio dello spazio.
+LLM_REQUIRED_BYTES = 2_300_000_000
+WHISPER_REQUIRED_BYTES = {
+    "tiny": 100_000_000,
+    "base": 200_000_000,
+    "small": 600_000_000,
+    "medium": 1_800_000_000,
+}
 
 # Repository ufficiali dei modelli Whisper gia' convertiti per
 # CTranslate2, quelli usati internamente da faster-whisper.
@@ -130,13 +141,34 @@ def _remote_size(url: str, timeout: int = 20) -> int:
     importante: confonderli farebbe fallire l'intero download per un
     file facoltativo, con un messaggio d'errore fuorviante.
     """
+    for tentativo in range(3):
+        try:
+            resp = requests.head(url, allow_redirects=True, timeout=timeout)
+            if resp.status_code == 404:
+                return FILE_ASSENTE
+            resp.raise_for_status()
+            declared = resp.headers.get("content-length")
+            if declared:
+                return int(declared)
+            break        # risposta buona ma muta: la lunghezza la chiedo alla GET
+        except requests.RequestException:
+            if tentativo == 2:
+                break
+            time.sleep(2 * (tentativo + 1))
+
+    # Ripiego. Molte reti di distribuzione e molti proxy aziendali non
+    # rispondono alla richiesta di sola intestazione, o non dichiarano la
+    # lunghezza. Prima bastava questo per far fallire tutta
+    # l'installazione con un messaggio che dava la colpa al server. Qui
+    # si chiede la stessa cosa a una richiesta normale: il corpo non
+    # viene mai letto, quindi costa una connessione, non un download.
     try:
-        resp = requests.head(url, allow_redirects=True, timeout=timeout)
-        if resp.status_code == 404:
-            return FILE_ASSENTE
-        resp.raise_for_status()
-        declared = resp.headers.get("content-length")
-        return int(declared) if declared else DIMENSIONE_IGNOTA
+        with requests.get(url, stream=True, timeout=timeout) as resp:
+            if resp.status_code == 404:
+                return FILE_ASSENTE
+            resp.raise_for_status()
+            declared = resp.headers.get("content-length")
+            return int(declared) if declared else DIMENSIONE_IGNOTA
     except requests.RequestException:
         return DIMENSIONE_IGNOTA
 
@@ -226,6 +258,14 @@ def _download_file(
             raise
         except (requests.RequestException, DownloadError, OSError) as exc:
             ultimo = exc
+            # Alcune risposte non miglioreranno mai aspettando: il file
+            # non c'e' (404), oppure il proxy aziendale lo nega (403).
+            # Ritentarle costava trentun secondi di attesa a vuoto per
+            # ciascun file, e capita al primo avvio ogni volta, perche'
+            # dei file facoltativi si prova prima una forma e poi l'altra.
+            stato = getattr(getattr(exc, "response", None), "status_code", None)
+            if stato in (400, 401, 403, 404, 405, 410):
+                raise
             scaricati = tmp.stat().st_size if tmp.exists() else 0
             if tentativo + 1 >= DOWNLOAD_ATTEMPTS:
                 break
@@ -471,24 +511,34 @@ def missing_models(whisper_size: str) -> list[str]:
     return missing
 
 
-def _check_disk_space() -> None:
+def _check_disk_space(whisper_size: str) -> None:
     """
-    Verifica lo spazio prima di cominciare.
+    Verifica lo spazio prima di cominciare, per quello che manca davvero.
 
     Senza questo controllo l'utente aspettava venti minuti e riceveva
     poi un messaggio grezzo del sistema ("No space left on device")
-    proveniente dal punto piu' improbabile del programma.
+    proveniente dal punto piu' improbabile del programma. Chiedere pero'
+    lo spazio di TUTTI i modelli anche quando ne manca uno solo bloccava
+    installazioni perfettamente possibili.
     """
+    richiesto = 0
+    if not whisper_model_present(whisper_size):
+        richiesto += WHISPER_REQUIRED_BYTES.get(whisper_size, 600_000_000)
+    if not llm_model_present():
+        richiesto += LLM_REQUIRED_BYTES
+    if richiesto <= 0:
+        return
+    richiesto = int(richiesto * 1.1)      # margine per il file in corso
     try:
         libero = shutil.disk_usage(config.MODELS_DIR).free
     except Exception:
         log.debug("Spazio su disco non verificabile", exc_info=True)
         return
-    if libero >= REQUIRED_FREE_BYTES:
+    if libero >= richiesto:
         return
     raise DownloadError(
-        "Spazio su disco insufficiente per i modelli AI: servono almeno "
-        f"{REQUIRED_FREE_BYTES / 1e9:.1f} GB liberi, ne risultano "
+        "Spazio su disco insufficiente per i modelli da scaricare: servono "
+        f"almeno {richiesto / 1e9:.1f} GB liberi, ne risultano "
         f"{libero / 1e9:.1f} GB. Libera spazio e riavvia il programma."
     )
 
@@ -500,7 +550,7 @@ def ensure_models_ready(
 ) -> None:
     """Scarica i modelli mancanti. Da eseguire fuori dal thread grafico."""
     if missing_models(whisper_size):
-        _check_disk_space()
+        _check_disk_space(whisper_size)
     if not whisper_model_present(whisper_size):
         log.info("Scarico il modello di trascrizione '%s'", whisper_size)
         download_whisper_model(whisper_size, on_progress, should_stop=should_stop)
