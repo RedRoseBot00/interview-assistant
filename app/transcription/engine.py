@@ -93,10 +93,28 @@ BACKLOG_GAP_SECONDS = 6.0
 OVERLOAD_RATIO = 1.15          # oltre questo carico non si sta al passo
 OVERLOAD_MIN_CALLS = 8         # non si decide su due misure
 MODEL_LADDER = ("medium", "small", "base", "tiny")
+# Quanti gradini si possono scendere in un solo colloquio. Due bastano
+# per arrivare da 'small' a 'tiny', che e' il caso delle macchine
+# virtuali a due core; di piu' sarebbe solo altalena.
+MAX_DOWNGRADES = 2
 
 # Ogni quante frasi lunghe si lascia il modello libero di ridire la sua
 # sulla lingua, per potersi ricredere su un blocco iniziale sbagliato.
 LANGUAGE_PROBE_EVERY = 8
+# Finche' la lingua non e' confermata si sonda molto piu' spesso: la
+# prima ipotesi guida gia' la decodifica, quindi se e' sbagliata deve
+# poter essere corretta in fretta e non dopo otto frasi illeggibili.
+LANGUAGE_PROBE_UNCONFIRMED = 2
+# Durata minima perche' valga la pena rimettere in discussione la
+# lingua. Sotto, il riconoscimento non e' affidabile e la frase verrebbe
+# soltanto rovinata.
+LANGUAGE_PROBE_MIN_SECONDS = 4.0
+
+# Quanto tempo si concede alla trascrizione per recuperare l'arretrato
+# dopo che l'utente ha premuto "Termina colloquio". Oltre, si abbandona
+# quello che resta: e' preferibile a un thread che continua a occupare
+# il processore per minuti mentre il programma scrive il report.
+STOP_GRACE_SECONDS = 40.0
 
 # Finestra temporale entro cui due frasi uguali su canali diversi sono
 # considerate la stessa frase (eco), non due interventi distinti.
@@ -267,6 +285,13 @@ class TranscriptionEngine:
         # cambiare; quando l'abbiamo dedotta noi, invece, restiamo
         # disposti a ricrederci.
         self._language_forced = language != "auto"
+        # La lingua attraversa tre stati: ignota, ipotizzata, confermata.
+        # Lo stato intermedio e' quello che mancava: la prima ipotesi
+        # guida gia' la decodifica — perche' decodificare nella lingua
+        # sbagliata rende una frase incomprensibile, non solo imprecisa —
+        # ma resta in discussione finche' non arrivano abbastanza voti
+        # concordi, e nel frattempo viene riverificata a frasi alterne.
+        self._language_confirmed = self._language_forced
         self._language_votes: Counter[str] = Counter()
         # Sblocco: servono voti CONSECUTIVI sulla stessa lingua nuova.
         self._unlock_candidate: Optional[str] = None
@@ -283,7 +308,13 @@ class TranscriptionEngine:
         self._arrival_gap = 0.0
         self._last_arrival: Optional[float] = None
         # Alleggerimento automatico del modello: una volta sola.
-        self._downgraded = False
+        # Quante volte si e' gia' sceso di un gradino nella scala dei
+        # modelli. Era un si'/no: su un computer molto lento un solo
+        # gradino non basta.
+        self._downgraded = 0
+        # Modello consigliato all'utente quando e' lui ad aver scelto
+        # quello attuale e questo non regge.
+        self.suggested_model = ""
         self.model_changed_to = ""
         # 0 = minimo indispensabile, 1 = ricerca media, 2 = ricerca ampia.
         # Si parte dal MINIMO e si sale solo dopo aver misurato che il
@@ -307,6 +338,9 @@ class TranscriptionEngine:
         self._local: deque[AudioChunk] = deque()
         self.echo_dropped = 0
         self.duplicates_dropped = 0
+        # Blocchi abbandonati perche' l'arretrato era troppo grande al
+        # momento dell'arresto: vanno detti all'utente, non nascosti.
+        self.dropped_on_stop = 0
         self.merged_utterances = 0
 
         # Conteggi aggiornati man mano. Ricalcolarli ogni secondo
@@ -402,10 +436,33 @@ class TranscriptionEngine:
 
         if thread.is_alive():
             log.error("Il thread di trascrizione non si e' fermato")
+            # Il thread continua a girare da solo, e questo non lo si puo'
+            # impedire: e' fermo dentro una chiamata al riconoscimento
+            # vocale, che non e' interrompibile. Cio' che si PUO' impedire
+            # e' che continui a parlare con l'interfaccia. Chi ha chiamato
+            # stop() sta per chiudere la sessione, e l'oggetto grafico
+            # verra' distrutto: il primo segmento che il thread produceva
+            # dopo quel momento faceva morire tutto con "Internal C++
+            # object already deleted", e con esso spariva anche il
+            # tentativo di segnalare l'errore.
+            self.detach_callbacks()
             return False
 
         self._thread = None
         return True
+
+    def detach_callbacks(self) -> None:
+        """
+        Taglia ogni collegamento con l'interfaccia.
+
+        Da chiamare quando la sessione sta per essere distrutta ma il
+        thread di trascrizione e' ancora vivo. Da quel momento il thread
+        lavora nel vuoto: consuma quello che ha in mano e finisce, senza
+        poter toccare oggetti che non esistono piu'.
+        """
+        self.on_segment = None
+        self.on_status = None
+        self.on_error = None
 
     def release_model(self) -> None:
         """
@@ -428,11 +485,34 @@ class TranscriptionEngine:
 
     # ------------------------------------------------------------------
     def _notify_status(self, message: str) -> None:
-        if self.on_status:
-            try:
-                self.on_status(message)
-            except Exception:
-                log.debug("Notifica di stato fallita", exc_info=True)
+        avviso = self.on_status
+        if avviso is None:
+            return
+        try:
+            avviso(message)
+        except RuntimeError:
+            self.detach_callbacks()
+        except Exception:
+            log.debug("Notifica di stato fallita", exc_info=True)
+
+    def _notify_error(self, exc: Exception) -> None:
+        """
+        Segnala un errore all'interfaccia senza poterne generare un altro.
+
+        Era l'ultimo anello della catena che faceva morire il thread di
+        trascrizione: il primo errore veniva raccolto, ma il tentativo di
+        raccontarlo all'interfaccia — nel frattempo distrutta — ne
+        sollevava un secondo, e quello non lo prendeva piu' nessuno.
+        """
+        segnala = self.on_error
+        if segnala is None:
+            return
+        try:
+            segnala(exc)
+        except RuntimeError:
+            self.detach_callbacks()
+        except Exception:
+            log.debug("Segnalazione dell'errore non riuscita", exc_info=True)
 
     @staticmethod
     def _lower_own_priority() -> None:
@@ -474,14 +554,36 @@ class TranscriptionEngine:
             self._notify_status("In ascolto")
         except Exception as exc:
             log.exception("Caricamento del modello non riuscito")
-            if self.on_error:
-                self.on_error(exc)
+            self._notify_error(exc)
             # Svuotiamo comunque la coda: senza consumatore i thread
             # audio la riempirebbero fino a scartare blocchi a vuoto.
             self._drain(audio_queue)
             return
 
+        scadenza_arresto: Optional[float] = None
         while True:
+            # Dopo "Termina colloquio" si concede un tempo limitato per
+            # recuperare l'arretrato, poi si smette. Prima non c'era
+            # alcun limite: con cinquanta frasi in coda e dieci secondi
+            # per frase, il thread restava a macinare piu' di otto minuti
+            # dopo la fine del colloquio, invisibile, tenendo occupato
+            # tutto il processore mentre il programma cercava di scrivere
+            # il report — e nel frattempo la finestra era gia' stata
+            # buttata via, il che lo faceva morire con un errore.
+            if self._stop.is_set():
+                if scadenza_arresto is None:
+                    scadenza_arresto = time.monotonic() + STOP_GRACE_SECONDS
+                elif time.monotonic() > scadenza_arresto:
+                    rimasti = (
+                        audio_queue.qsize() + len(self._local) + len(self._waiting)
+                    )
+                    if rimasti:
+                        log.warning(
+                            "Arresto: abbandono %d blocchi non trascritti dopo %.0f s",
+                            rimasti, STOP_GRACE_SECONDS,
+                        )
+                        self.dropped_on_stop = rimasti
+                    break
             try:
                 chunk = self._next_chunk(audio_queue, timeout=0.4)
             except queue.Empty:
@@ -497,8 +599,7 @@ class TranscriptionEngine:
                     self._flush_waiting(force=self._stop.is_set())
                 except Exception as exc:
                     log.exception("Errore nello smaltimento delle frasi in attesa")
-                    if self.on_error:
-                        self.on_error(exc)
+                    self._notify_error(exc)
                     self._waiting.clear()
                 self._update_parked(audio_queue)
                 if self._stop.is_set() and not self._waiting:
@@ -524,8 +625,7 @@ class TranscriptionEngine:
                 self._accept(self._merge_following(audio_queue, chunk))
             except Exception as exc:
                 log.exception("Errore durante l'elaborazione di un blocco")
-                if self.on_error:
-                    self.on_error(exc)
+                self._notify_error(exc)
             self._update_parked(audio_queue)
 
         # Lo svuotamento finale va protetto quanto il resto: e' il
@@ -536,8 +636,7 @@ class TranscriptionEngine:
             self._flush_waiting(force=True)
         except Exception as exc:
             log.exception("Errore nello svuotamento finale")
-            if self.on_error:
-                self.on_error(exc)
+            self._notify_error(exc)
         if self.echo_dropped or self.duplicates_dropped:
             log.info(
                 "Eco gestita: %d blocchi scartati sul segnale, %d frasi duplicate",
@@ -931,7 +1030,9 @@ class TranscriptionEngine:
             float(getattr(info, "language_probability", 0.0) or 0.0),
             parlato,
             len(text.split()),
-            probe=sonda,
+            # Solo i verdetti espressi liberamente contano: se la lingua
+            # gliel'abbiamo passata noi, il riconoscimento ce la ripete.
+            libera=lingua_chiamata is None,
         )
 
         with self._lock:
@@ -987,8 +1088,24 @@ class TranscriptionEngine:
             )
             self.segments.append(segment)
 
-        if self.on_segment:
-            self.on_segment(segment)
+        # La consegna all'interfaccia non deve mai poter uccidere il
+        # thread. Fra il controllo e la chiamata la sessione puo' essere
+        # stata distrutta — e' proprio quello che succedeva chiudendo il
+        # colloquio mentre la trascrizione era ancora indietro: partiva
+        # un "Internal C++ object already deleted" che faceva morire il
+        # thread, e con lui tutte le frasi ancora da trascrivere.
+        consegna = self.on_segment
+        if consegna is not None:
+            try:
+                consegna(segment)
+            except RuntimeError:
+                log.info(
+                    "Interfaccia non piu' disponibile: proseguo senza mostrare "
+                    "le frasi a schermo"
+                )
+                self.detach_callbacks()
+            except Exception:
+                log.exception("Consegna di una frase all'interfaccia non riuscita")
 
     # ------------------------------------------------------------------
     def _forget_last(self, speaker: str) -> None:
@@ -1070,12 +1187,24 @@ class TranscriptionEngine:
         """Vero quando conviene rifare il riconoscimento della lingua."""
         if self._locked_language is None or self._language_forced:
             return False
-        if duration < config.LANGUAGE_VOTE_MIN_SECONDS:
+        # Una sonda si paga: quella frase viene decodificata nella lingua
+        # che il modello indovina, e su un frammento di due secondi
+        # indovina malissimo — nel log di un colloquio italiano sono
+        # uscite frasi in giapponese proprio cosi'. Si sonda quindi solo
+        # su frasi abbastanza lunghe da meritare fiducia; sulle altre si
+        # resta sulla lingua gia' nota, che e' sempre la scelta migliore.
+        if duration < LANGUAGE_PROBE_MIN_SECONDS:
             return False
         if self._probe_countdown > 0:
             self._probe_countdown -= 1
             return False
-        self._probe_countdown = LANGUAGE_PROBE_EVERY
+        # Finche' la lingua e' solo un'ipotesi si controlla molto piu'
+        # spesso: e' quell'ipotesi a guidare la decodifica, quindi se e'
+        # sbagliata va corretta subito.
+        self._probe_countdown = (
+            LANGUAGE_PROBE_EVERY if self._language_confirmed
+            else LANGUAGE_PROBE_UNCONFIRMED
+        )
         return True
 
     def _vote_is_trustworthy(
@@ -1102,33 +1231,58 @@ class TranscriptionEngine:
         probability: float,
         duration: float,
         words: int,
-        probe: bool = False,
+        libera: bool = False,
     ) -> None:
-        if self._language_forced or not detected:
+        """
+        `libera` = alla chiamata NON era stata imposta alcuna lingua.
+
+        E' la condizione senza la quale nulla di tutto questo ha senso.
+        Quando si impone una lingua, il riconoscimento la restituisce
+        identica con probabilita' 1: contarla come un voto significava
+        farsi dare ragione da se stessi, e una prima ipotesi sbagliata si
+        sarebbe autoconfermata in quattro frasi senza scampo.
+        """
+        if self._language_forced or not detected or not libera:
             return
         if not self._vote_is_trustworthy(detected, probability, duration, words):
             return
 
-        if self._locked_language is None:
+        if not self._language_confirmed:
             self._language_votes[detected] += 1
             classifica = self._language_votes.most_common(2)
             lingua, voti = classifica[0]
             seconda = classifica[1][1] if len(classifica) > 1 else 0
+
+            # Ipotesi provvisoria, presa gia' al primo verdetto
+            # affidabile. E' la correzione piu' importante di tutte:
+            # finche' non c'era alcuna lingua, OGNI chiamata lasciava il
+            # modello libero di indovinarla da capo — su frasi di due
+            # secondi. Nei log di un colloquio italiano si leggevano di
+            # seguito francese, francese, russo, inglese e giapponese: e
+            # una frase decodificata nella lingua sbagliata non e'
+            # imprecisa, e' incomprensibile. Da qui in avanti si decodifica
+            # sempre nella lingua piu' probabile finora, e la si continua
+            # a mettere in discussione con le sonde.
+            if lingua != self._locked_language:
+                if self._locked_language is None:
+                    log.info("Lingua provvisoria del colloquio: '%s'", lingua)
+                else:
+                    log.info(
+                        "Lingua provvisoria corretta da '%s' a '%s'",
+                        self._locked_language, lingua,
+                    )
+                self._locked_language = lingua
+                self._probe_countdown = 0     # riverifica alla prossima frase
+
             if (
                 voti >= config.LANGUAGE_LOCK_VOTES
                 and voti - seconda >= config.LANGUAGE_LOCK_MARGIN
             ):
-                self._locked_language = lingua
+                self._language_confirmed = True
                 log.info("Lingua del colloquio fissata su '%s'", lingua)
                 self._notify_status(f"Lingua riconosciuta: {lingua}")
             return
 
-        # Lingua gia' fissata: il verdetto vale solo se e' arrivato da
-        # una sonda, cioe' da una chiamata in cui il modello era libero
-        # di scegliere. Altrimenti ci confermerebbe soltanto la lingua
-        # che gli abbiamo imposto noi.
-        if not probe:
-            return
         # I voti di sblocco devono essere CONSECUTIVI. Accumulandoli
         # senza mai farli decadere, tre sonde sbagliate anche distanti
         # mezz'ora l'una dall'altra ribaltavano la lingua di un
@@ -1205,7 +1359,9 @@ class TranscriptionEngine:
         raffica passeggera. Se e' stato l'utente a scegliere il modello,
         non si tocca nulla — si limita ad avvisare.
         """
-        if self._downgraded or self._speed_samples < OVERLOAD_MIN_CALLS:
+        if self._downgraded >= MAX_DOWNGRADES or self._speed_samples < (
+            OVERLOAD_MIN_CALLS
+        ):
             return
         if self.load <= OVERLOAD_RATIO:
             return
@@ -1218,7 +1374,13 @@ class TranscriptionEngine:
             return
         piu_leggero = MODEL_LADDER[posizione + 1]
 
-        self._downgraded = True     # in ogni caso non si riprova
+        # Si puo' scendere piu' di un gradino. Prima ci si fermava al
+        # primo, e su una macchina davvero lenta non bastava: nei log di
+        # un computer a due core il modello 'small' costava dieci secondi
+        # a frase, e anche 'base' sarebbe rimasto indietro. Dopo ogni
+        # cambio le misure ripartono da zero, quindi il gradino
+        # successivo viene deciso su dati nuovi, non su quelli vecchi.
+        self._downgraded += 1
 
         from app import settings
 
@@ -1227,11 +1389,24 @@ class TranscriptionEngine:
         # modello dava sempre falso, e la scelta dell'utente sarebbe
         # stata scavalcata in silenzio.
         if "whisper_model_size" in (settings.get("user_choices") or ()):
+            self._downgraded = MAX_DOWNGRADES     # una volta sola, e basta
+            # Il consiglio deve essere concreto: quanto costa adesso una
+            # frase, e quale modello scegliere. "Prova un modello piu'
+            # leggero" non dice ne' quale ne' perche'.
+            self.suggested_model = piu_leggero
+            # Il tempo si cita solo se e' un numero che significa
+            # qualcosa detto ad alta voce: "circa 0 secondi" farebbe
+            # sembrare rotto l'avviso invece del computer.
+            quanto = (
+                f"impiega circa {self._call_cost:.0f} secondi per ogni frase"
+                if self._call_cost >= 1.5
+                else "non riesce a stare al passo del parlato"
+            )
             self._notify_status(
-                f"Il modello '{self.model_size}' non sta al passo su questo "
-                "computer: i sottotitoli accumulano ritardo. Lo hai scelto tu, "
-                "quindi non lo cambio: se vuoi, passa a un modello piu' "
-                "leggero dalle impostazioni."
+                f"Il modello '{self.model_size}' {quanto} su questo computer: "
+                f"i sottotitoli restano sempre piu' indietro. Lo hai scelto "
+                f"tu, quindi non lo cambio — ma dalle impostazioni conviene "
+                f"passare a '{piu_leggero}'."
             )
             return
 
