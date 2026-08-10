@@ -56,6 +56,9 @@ class InterviewSession(QObject):
         self._start_thread: threading.Thread | None = None
         self.clean_shutdown = True
         self._warnings_shown = 0
+        # Vero quando l'interfaccia non c'e' piu' e i segnali vanno
+        # lasciati cadere invece che emessi.
+        self._detached = False
 
         self.recorder = AudioRecorder(
             capture_microphone=capture_microphone,
@@ -82,19 +85,62 @@ class InterviewSession(QObject):
         self._last_level_emit[speaker] = now
         self.level_changed.emit(speaker, level)
 
+    # Questi tre metodi vengono chiamati DA ALTRI THREAD, e possono
+    # arrivare dopo che la finestra ha gia' buttato via la sessione: se
+    # il riconoscimento vocale e' rimasto indietro, il suo thread e'
+    # fermo dentro una chiamata non interrompibile e finisce il lavoro
+    # con calma, molto dopo che l'utente ha premuto "Termina". A quel
+    # punto l'oggetto grafico sottostante non esiste piu' e Qt solleva
+    # "Internal C++ object already deleted": era questo a far morire di
+    # colpo il thread di trascrizione, portandosi via tutte le frasi
+    # ancora da elaborare. Un segnale che non trova piu' nessuno non e'
+    # un guasto: e' semplicemente troppo tardi, e va lasciato cadere.
     def _handle_segment(self, segment: TranscriptSegment) -> None:
-        self.segment_received.emit(segment.to_dict())
+        if self._detached:
+            return
+        try:
+            self.segment_received.emit(segment.to_dict())
+        except RuntimeError:
+            self.detach()
 
     def _handle_status(self, message: str) -> None:
-        self.status_changed.emit(message)
+        if self._detached:
+            return
+        try:
+            self.status_changed.emit(message)
+        except RuntimeError:
+            self.detach()
 
     def _handle_engine_error(self, exc: Exception) -> None:
-        self.error_raised.emit(str(exc))
+        if self._detached:
+            return
+        try:
+            self.error_raised.emit(str(exc))
+        except RuntimeError:
+            self.detach()
 
     def _handle_audio_error(self, speaker: str, exc: Exception) -> None:
-        self.warning_raised.emit(
-            f"La sorgente audio '{speaker}' si e' interrotta: {exc}"
-        )
+        if self._detached:
+            return
+        try:
+            self.warning_raised.emit(
+                f"La sorgente audio '{speaker}' si e' interrotta: {exc}"
+            )
+        except RuntimeError:
+            self.detach()
+
+    def detach(self) -> None:
+        """
+        Smette di parlare con l'interfaccia.
+
+        Da chiamare prima di distruggere la sessione, e automaticamente
+        alla prima avvisaglia che l'oggetto grafico non c'e' piu'.
+        """
+        self._detached = True
+        try:
+            self.engine.detach_callbacks()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Avvio
@@ -238,6 +284,17 @@ class InterviewSession(QObject):
         for message in nuovi:
             self.warning_raised.emit(message)
 
+        # Frasi abbandonate perche' la trascrizione era troppo indietro
+        # quando il colloquio e' finito. Vanno dette: mancano dal report,
+        # e chi le ha pronunciate merita di saperlo.
+        abbandonate = int(getattr(self.engine, "dropped_on_stop", 0) or 0)
+        if abbandonate:
+            self.warning_raised.emit(
+                f"{abbandonate} frasi non sono state trascritte: al termine "
+                "del colloquio la trascrizione era ancora troppo indietro. "
+                "Con un modello piu' leggero non succede."
+            )
+
         # Il modello di trascrizione occupa centinaia di megabyte e non
         # serve piu' a nulla: il colloquio e' finito, e subito dopo il
         # programma ne carica un altro da due gigabyte per scrivere il
@@ -287,6 +344,21 @@ class InterviewSession(QObject):
     def pending_seconds(self) -> float:
         """Secondi di parlato ancora da trascrivere."""
         return float(getattr(self.engine, "backlog_seconds", 0.0))
+
+    @property
+    def suggested_model(self) -> str:
+        """Modello consigliato quando quello scelto non regge."""
+        return str(getattr(self.engine, "suggested_model", "") or "")
+
+    @property
+    def call_cost_seconds(self) -> float:
+        """Secondi impiegati in media per trascrivere una frase."""
+        return float(getattr(self.engine, "_call_cost", 0.0) or 0.0)
+
+    @property
+    def dropped_on_stop(self) -> int:
+        """Frasi abbandonate perche' l'arretrato era troppo grande."""
+        return int(getattr(self.engine, "dropped_on_stop", 0) or 0)
 
     @property
     def speakers_detected(self) -> bool:

@@ -1045,6 +1045,15 @@ class MainWindow(QMainWindow):
     def _release_session(self) -> None:
         if self.session is None:
             return
+        # PRIMA di scollegare e distruggere: se il riconoscimento vocale
+        # e' rimasto indietro, il suo thread e' ancora vivo e continuera'
+        # a produrre frasi per un pezzo. Va avvisato che da qui in avanti
+        # non c'e' piu' nessuno ad ascoltarlo, altrimenti il primo
+        # segnale verso un oggetto ormai distrutto lo fa morire di colpo.
+        try:
+            self.session.detach()
+        except Exception:
+            log.debug("Sessione gia' scollegata", exc_info=True)
         try:
             self.session.disconnect()
         except (RuntimeError, TypeError):
@@ -1441,10 +1450,30 @@ class MainWindow(QMainWindow):
             # secondo, che non valgono nulla ma facevano scattare
             # l'avviso entro i primi due secondi di ogni colloquio.
             if self.session.pending_seconds >= 20.0:
-                self._add_warning(
-                    "La trascrizione non sta al passo del parlato: nelle "
-                    "impostazioni puoi scegliere un modello piu' leggero."
-                )
+                # L'avviso deve dire quale modello scegliere e perche',
+                # non limitarsi a lamentarsi. Su un computer a due core
+                # il modello 'small' arriva a costare dieci secondi per
+                # frase: senza quel numero davanti, "prova un modello
+                # piu' leggero" sembra un consiglio generico da ignorare.
+                consigliato = self.session.suggested_model
+                costo = self.session.call_cost_seconds
+                if consigliato:
+                    quanto = (
+                        f"impiega circa {costo:.0f} secondi per trascrivere "
+                        f"ogni frase"
+                        if costo >= 1.5
+                        else "non riesce a trascrivere alla velocita' del parlato"
+                    )
+                    self._add_warning(
+                        f"Questo computer {quanto}: i sottotitoli restano "
+                        f"sempre piu' indietro. Nelle impostazioni scegli il "
+                        f"modello '{consigliato}'."
+                    )
+                else:
+                    self._add_warning(
+                        "La trascrizione non sta al passo del parlato: nelle "
+                        "impostazioni puoi scegliere un modello piu' leggero."
+                    )
 
     def _refresh_platform(self) -> None:
         # Occasione buona anche per accorgersi che la finestra della
