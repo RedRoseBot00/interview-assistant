@@ -11,7 +11,7 @@ from pathlib import Path
 
 APP_NAME = "InterviewAssistant"
 APP_DISPLAY_NAME = "Interview Assistant"
-APP_VERSION = "4.0.0"
+APP_VERSION = "4.1.0"
 
 # --------------------------------------------------------------------------
 # Percorsi applicazione
@@ -150,10 +150,17 @@ LLM_CONTEXT_MAX = 4096
 # tolti): 4500 caratteri di testo compattato contengono piu' sostanza
 # di 7000 caratteri grezzi, e costano un terzo del tempo di lettura.
 LLM_MAX_TRANSCRIPT_CHARS = 4500
+# Sui computer con due soli core la lettura del testo costa cara quanto
+# la scrittura: si accorcia un po' la trascrizione consegnata al
+# modello. E' un compromesso dichiarato: meno contesto, report prima.
+LLM_MAX_TRANSCRIPT_CHARS_SLOW = 3600
 # Il formato richiesto al modello sta in 300-380 token: con un tetto
 # generoso il modello riempie lo spazio disponibile con ripetizioni,
 # facendo aspettare l'utente per testo che non aggiunge nulla.
-LLM_MAX_TOKENS = 450
+# Il formato asciutto sta in ~170 token; il tetto serve solo a tagliare
+# il caso patologico in cui il modello si ripete. Ogni token oltre il
+# necessario costa un quarto di secondo su un computer a due core.
+LLM_MAX_TOKENS = 320
 # Da non alzare sopra 512 senza prima verificarlo: la versione di
 # llama-cpp-python che usiamo non espone n_ubatch, che resta fisso a
 # 512. Con n_batch piu' grande i due valori divergono e la lettura del

@@ -18,6 +18,7 @@ import atexit
 import datetime as _dt
 import faulthandler
 import logging
+import os
 import sys
 import threading
 from pathlib import Path
@@ -59,10 +60,33 @@ def crash_file() -> Path:
     return _log_dir() / f"ultimo-crash-{_process_role()}.txt"
 
 
+def _pulisci_log_vecchi(cartella: Path, giorni: int = 14) -> None:
+    """
+    Elimina i log piu' vecchi di due settimane.
+
+    Un file al giorno senza mai cancellare significa un disco che si
+    riempie piano piano sui computer dei clienti — proprio quelli dove
+    il disco e' gia' il problema.
+    """
+    import time as _time
+
+    soglia = _time.time() - giorni * 86400
+    try:
+        for vecchio in cartella.glob("interview-assistant-*.log"):
+            try:
+                if vecchio.stat().st_mtime < soglia:
+                    vecchio.unlink()
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
 def setup_logging(verbose: bool = False) -> Path:
     """Configura il logging su file (e su console se disponibile)."""
     log_path = current_log_file()
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    _pulisci_log_vecchi(log_path.parent)
 
     handlers: list[logging.Handler] = []
 
@@ -123,9 +147,17 @@ def _install_fault_handler() -> None:
                 precedente.unlink(missing_ok=True)
                 path.replace(precedente)
         except Exception:
+            # Su Windows il file puo' essere ancora aperto da un'altra
+            # istanza del programma: rinominarlo fallisce, e aprirlo
+            # comunque in scrittura TRONCHEREBBE il referto che quella
+            # istanza sta tenendo — proprio quello che si stava cercando
+            # di leggere. In quel caso si scrive su un file con il
+            # numero di processo, senza toccare quello altrui.
             logging.getLogger(__name__).debug(
                 "Referto precedente non conservato", exc_info=True
             )
+            if path.exists():
+                path = path.with_name(f"{path.stem}-{os.getpid()}{path.suffix}")
         _fault_file = open(path, "w", encoding="utf-8")
         _fault_file.write(
             "Questo file riguarda l'esecuzione corrente; quello dell'avvio "

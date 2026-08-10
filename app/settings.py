@@ -104,6 +104,9 @@ DEFAULTS: dict[str, Any] = {
     # Secondi misurati dal controllo preventivo per una chiamata di
     # trascrizione su questo computer. Zero = mai misurato.
     "engine_speed_seconds": 0.0,
+    # Modello consigliato dalla taratura quando quello scelto dall'utente
+    # non regge: vuoto = niente da chiedere.
+    "pending_model_advice": "",
     # Interfaccia
     "always_on_top": False,
     # Uso interno: vedi TUNING_REVISION.
