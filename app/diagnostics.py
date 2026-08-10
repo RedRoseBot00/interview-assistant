@@ -121,6 +121,9 @@ class SelfTestResult:
     # aver dato una risposta.
     inconclusive: bool = False
     reason: str = ""
+    # Secondi impiegati dal figlio per UNA chiamata di trascrizione.
+    # Zero quando il test non l'ha misurata.
+    call_seconds: float = 0.0
 
     @property
     def state(self) -> str:
@@ -232,6 +235,47 @@ def _run_child(
     return proc.returncode, "".join(raccolto).strip()
 
 
+# Costo relativo di una chiamata per ciascun modello, riferito a
+# 'small' = 1. Misure di lavoro dell'encoder confermate sul campo.
+COSTI_RELATIVI = {"medium": 3.3, "small": 1.0, "base": 0.35, "tiny": 0.15}
+# Costo per chiamata oltre il quale il modello non regge il ritmo di un
+# dialogo: le battute si alternano ogni quattro-sei secondi.
+SPEED_TARGET_SECONDS = 4.0
+
+
+def _parse_call_seconds(output: str) -> float:
+    """Estrae la misura di velocita' stampata dal processo figlio."""
+    for riga in reversed(output.splitlines()):
+        riga = riga.strip()
+        if riga.startswith("VELOCITA_CHIAMATA="):
+            try:
+                return max(0.0, float(riga.split("=", 1)[1]))
+            except ValueError:
+                return 0.0
+    return 0.0
+
+
+def modello_per_velocita(misurato: float, size: str) -> str:
+    """
+    Il modello piu' grande che questo computer riesce a reggere.
+
+    Con la misura vera di quanto costa una chiamata, la scelta smette di
+    essere una scommessa sull'architettura: si scende la scala finche'
+    il costo stimato non rientra nel ritmo di un dialogo. Non si sale
+    mai — se il computer regge comodamente il modello scelto, resta
+    quello: il margine in piu' va in qualita' della decodifica, non in
+    un cambio non richiesto.
+    """
+    if misurato <= 0 or size not in COSTI_RELATIVI:
+        return size
+    unita = misurato / COSTI_RELATIVI[size]
+    scala = ("medium", "small", "base", "tiny")
+    for candidato in scala[scala.index(size):]:
+        if unita * COSTI_RELATIVI[candidato] <= SPEED_TARGET_SECONDS:
+            return candidato
+    return "tiny"
+
+
 def run_transcription_selftest(
     whisper_size: str, should_stop: StopFn = None
 ) -> SelfTestResult:
@@ -262,7 +306,10 @@ def run_transcription_selftest(
         last_detail, last_code = detail, code
         if code == 0:
             log.info("Test superato (compatibilita'=%s)", force_generic)
-            return SelfTestResult(True, force_generic, detail)
+            return SelfTestResult(
+                True, force_generic, detail,
+                call_seconds=_parse_call_seconds(detail),
+            )
         if code == EXIT_CANCELLED:
             return SelfTestResult(
                 False, False, detail, inconclusive=True, reason="annullato"
@@ -343,10 +390,21 @@ def selftest_transcription_child() -> int:
         rng = np.random.default_rng(0)
         audio = (rng.standard_normal(config.AUDIO_SAMPLE_RATE) * 0.001).astype("float32")
 
+        inizio = time.monotonic()
         segments, _info = model.transcribe(audio, language="en", beam_size=1)
         list(segments)  # forza l'esecuzione effettiva del decoder
+        durata = time.monotonic() - inizio
 
-        log.info("Motore di trascrizione funzionante")
+        # Il numero piu' prezioso dell'intero test: quanto costa UNA
+        # chiamata al riconoscimento su questo computer. Va sulla
+        # stampa, non solo nel log, perche' e' il padre a doverlo
+        # leggere: gli serve per scegliere il modello di partenza PRIMA
+        # del primo colloquio, invece di scoprire a colloquio in corso
+        # che quello selezionato non sta al passo.
+        print(f"VELOCITA_CHIAMATA={durata:.2f}", flush=True)
+        log.info(
+            "Motore di trascrizione funzionante (%.1f s a chiamata)", durata
+        )
         return 0
     except Exception:
         # Il dettaglio finisce nel file di log: nelle applicazioni senza

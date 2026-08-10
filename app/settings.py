@@ -101,6 +101,9 @@ DEFAULTS: dict[str, Any] = {
     # programma — e con lui le librerie di calcolo — si ereditava un
     # verdetto preso su un'altra libreria.
     "engine_selftest_fingerprint": "",
+    # Secondi misurati dal controllo preventivo per una chiamata di
+    # trascrizione su questo computer. Zero = mai misurato.
+    "engine_speed_seconds": 0.0,
     # Interfaccia
     "always_on_top": False,
     # Uso interno: vedi TUNING_REVISION.

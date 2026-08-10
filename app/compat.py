@@ -115,27 +115,11 @@ def is_emulated() -> bool:
     return False
 
 
-def cpu_supports_avx2() -> bool:
-    """
-    Verifica la presenza di AVX2 leggendo CPUID (foglia 7, EBX bit 5).
-
-    Restituisce True in caso di dubbio: preferiamo non attivare la
-    modalita' lenta senza motivo. Il rilevamento definitivo avviene
-    comunque con il test di avvio in diagnostics.py, che e' empirico.
-    """
-    if is_emulated():
-        # Sotto emulazione CPUID puo' mentire: trattiamo come non sicuro.
-        return False
-    if process_machine() not in ("AMD64", "X86_64"):
-        return True
-    try:
-        # Su Windows non esiste un modo semplice e portabile di eseguire
-        # CPUID da Python puro senza dipendenze; ci affidiamo al test
-        # empirico di diagnostics.py. Qui assumiamo supporto presente.
-        return True
-    except Exception:
-        return True
-
+# La vecchia cpu_supports_avx2() e' stata rimossa: non era chiamata da
+# nessuna parte e il suo corpo restituiva comunque sempre True. Il
+# rilevamento vero e' quello empirico del test di avvio, piu' la misura
+# di velocita' che ne deriva: si giudica il computer da cio' che fa, non
+# da cio' che dichiara.
 
 _job_handle = None
 

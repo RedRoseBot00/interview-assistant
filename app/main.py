@@ -54,6 +54,26 @@ def run_gui() -> int:
     app.setApplicationName("InterviewAssistant")
     app.setOrganizationName("InterviewAssistant")
 
+    # L'icona del programma. Era inclusa nel pacchetto da sempre, ma
+    # nessuno la impostava: finestra e barra delle applicazioni
+    # mostravano l'icona generica di Windows, e a colpo d'occhio l'app
+    # sembrava un programma qualunque ancora da configurare.
+    try:
+        from pathlib import Path
+
+        from PySide6.QtGui import QIcon
+
+        base = Path(getattr(sys, "_MEIPASS", "")) or Path(__file__).resolve().parent.parent
+        for candidata in (
+            Path(__file__).resolve().parent / "resources" / "icon.ico",
+            base / "app" / "resources" / "icon.ico",
+        ):
+            if candidata.exists():
+                app.setWindowIcon(QIcon(str(candidata)))
+                break
+    except Exception:
+        log.debug("Icona dell'applicazione non impostata", exc_info=True)
+
     from app import config, single_instance
     from app.ui import theme
 
