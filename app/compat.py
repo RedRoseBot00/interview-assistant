@@ -65,6 +65,34 @@ def native_machine() -> str:
             ctypes.byref(process_machine),
             ctypes.byref(native),
         )
+        if ok and _MACHINE_NAMES.get(native.value) == "ARM64":
+            return "ARM64"
+
+        # IsWow64Process2 non basta da solo: per i processi x64 emulati
+        # su Windows ARM64 alcune versioni riportano AMD64 come macchina
+        # nativa. GetMachineTypeAttributes (Windows 11 in poi, cioe'
+        # esattamente dove esiste l'emulazione x64) dice se questa
+        # macchina esegue ARM64 nativamente.
+        try:
+            if hasattr(kernel32, "GetMachineTypeAttributes"):
+                IMAGE_FILE_MACHINE_ARM64 = 0xAA64
+                attrs = ctypes.c_int(0)
+                esito = kernel32.GetMachineTypeAttributes(
+                    IMAGE_FILE_MACHINE_ARM64, ctypes.byref(attrs)
+                )
+                # UserEnabled = 0x1: i programmi ARM64 girano nativamente.
+                if esito == 0 and (attrs.value & 0x1):
+                    return "ARM64"
+        except Exception:
+            pass
+
+        # Ultimo ripiego: le cartelle SysArm32/SyChpe32 esistono solo
+        # nelle installazioni di Windows su ARM.
+        root = os.environ.get("SystemRoot", r"C:\Windows")
+        for nome in ("SysArm32", "SyChpe32"):
+            if os.path.isdir(os.path.join(root, nome)):
+                return "ARM64"
+
         if ok:
             return _MACHINE_NAMES.get(native.value, hex(native.value))
     except Exception:
