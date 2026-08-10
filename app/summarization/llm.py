@@ -218,12 +218,16 @@ def context_size_for(prompt: str, system: str, max_tokens: int) -> int:
     gia' residenti, e' proprio quella memoria in piu' a far cominciare
     lo scambio su disco: da li' in avanti non conta piu' nient'altro.
 
-    La stima e' volutamente prudente (due caratteri per token contro i
-    tre e mezzo tipici delle lingue latine): sbagliare per eccesso costa un
-    po' di memoria, sbagliare per difetto farebbe fallire il report.
+    Tre caratteri per token: resta prudente rispetto ai tre e mezzo
+    tipici delle lingue latine, ma non piu' del doppio come la stima
+    precedente a due caratteri, che raddoppiava la cache delle chiavi
+    proprio sulla macchina che si voleva proteggere. Sbagliare per
+    difetto non fa comunque fallire nulla: dentro il processo che scrive
+    il report c'e' _fit_prompt, che ricontrolla con il tokenizzatore
+    vero e accorcia il testo se serve.
     """
     caratteri = len(prompt) + len(system)
-    stima = int(caratteri / 2.0) + max_tokens + 256
+    stima = int(caratteri / 3.0) + max_tokens + 256
     arrotondato = ((stima + 255) // 256) * 256
     return max(config.LLM_CONTEXT_MIN, min(config.LLM_CONTEXT_MAX, arrotondato))
 
@@ -607,6 +611,14 @@ def generate_report(
         # compatibilita' la fissava a 1 e dimezzava la generazione.
         ambiente = dict(os.environ)
         ambiente.pop("OMP_NUM_THREADS", None)
+        # Il canale fra padre e figlio porta JSON con caratteri veri, di
+        # qualunque lingua. Senza questa indicazione Python userebbe la
+        # codifica locale — su Windows in italiano e' cp1252, che non sa
+        # scrivere ne' il cirillico ne' il greco ne' gli ideogrammi: il
+        # figlio falliva a ogni riga, l'errore veniva ingoiato, e
+        # l'utente restava a fissare un riquadro vuoto per tutto il
+        # tempo della generazione senza sapere perche'.
+        ambiente["PYTHONIOENCODING"] = "utf-8"
 
         # Gli errori del figlio vanno su file, non nel nulla. Con
         # stderr=DEVNULL qualunque uscita diversa da zero — anche una
@@ -626,13 +638,24 @@ def generate_report(
                     stdout=subprocess.PIPE,
                     stderr=errori,
                     text=True,
-                    # Senza errors="replace" un carattere non
-                    # decodificabile interromperebbe la lettura a meta'
-                    # generazione.
+                    # La codifica va detta, non lasciata al sistema: e'
+                    # UTF-8 da entrambe le parti. Senza errors="replace"
+                    # un carattere non decodificabile interromperebbe la
+                    # lettura a meta' generazione.
+                    encoding="utf-8",
                     errors="replace",
                     env=ambiente,
                     creationflags=creationflags,
                 )
+            # Se il programma principale muore, Windows chiude anche
+            # questo: altrimenti resterebbe a occupare due gigabyte e
+            # tutti i core, invisibile, per diversi minuti.
+            try:
+                from app import compat
+
+                compat.adotta_processo_figlio(proc)
+            except Exception:
+                log.debug("Figlio non associato al job object", exc_info=True)
             _active_child = proc
 
         child_out = ""
@@ -775,6 +798,15 @@ def generate_report_child(input_path: str, output_path: str) -> int:
     attesa per minuti. Il testo completo viene comunque salvato nel
     file di uscita, che resta la fonte definitiva.
     """
+    # Il padre legge questo flusso come UTF-8: qui va scritto UTF-8,
+    # qualunque sia la codifica locale del computer. Su un Windows in
+    # italiano sarebbe cp1252, e ogni riga di report in russo, greco,
+    # arabo o cinese moriva silenziosamente prima di partire.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
     try:
         payload = json.loads(Path(input_path).read_text(encoding="utf-8"))
 
