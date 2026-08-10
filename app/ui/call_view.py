@@ -44,7 +44,7 @@ IS_WINDOWS = sys.platform == "win32"
 # processore: trascinando o ridimensionando la finestra arrivavano
 # decine di richieste al secondo, e l'immagine della videochiamata
 # diventava a scatti. Qui se ne lascia passare al massimo una ogni
-# sessantesimo di secondo, con l'ultima sempre garantita.
+# sessanta millisecondi, con l'ultima sempre garantita.
 REFRESH_MIN_INTERVAL_MS = 60.0
 # Le dimensioni della finestra di origine cambiano solo quando qualcuno
 # la ridimensiona: chiederle a ogni riallineamento e' una chiamata al
@@ -101,13 +101,24 @@ MEETING_HINTS = ("meet", "zoom", "teams", "webex", "riunione", "meeting", "call"
 # significa aprire il processo e interrogarlo: con quaranta finestre
 # aperte erano quaranta operazioni a ogni aggiornamento dell'elenco,
 # tutte sul filo che disegna la finestra. Il nome di un processo non
-# cambia mai finche' il processo vive, quindi si ricorda.
+# cambia mai finche' il processo vive — ma i NUMERI di processo vengono
+# riciclati: chiuso Zoom, il suo numero puo' finire a un altro
+# programma, e la tabella etichetterebbe come videochiamata la finestra
+# sbagliata. Quindi si ricorda, ma con una scadenza.
 _process_cache: dict[int, str] = {}
+_process_cache_born = 0.0
+_PROCESS_CACHE_TTL = 300.0
 
 
 def _process_name(handle: int) -> str:
+    global _process_cache_born
     try:
         import psutil
+
+        adesso = time.monotonic()
+        if adesso - _process_cache_born > _PROCESS_CACHE_TTL:
+            _process_cache.clear()
+            _process_cache_born = adesso
 
         pid = wintypes.DWORD()
         ctypes.windll.user32.GetWindowThreadProcessId(
@@ -119,11 +130,6 @@ def _process_name(handle: int) -> str:
         if noto is not None:
             return noto
         nome = psutil.Process(pid.value).name()
-        if len(_process_cache) > 512:
-            # Un colloquio non apre mai cosi' tanti programmi: se ci
-            # arriviamo e' segno che i numeri vengono riciclati, e la
-            # tabella va ricominciata da capo.
-            _process_cache.clear()
         _process_cache[pid.value] = nome
         return nome
     except Exception:
@@ -227,6 +233,11 @@ class CallView(QWidget):
         self._source_size = (16, 9)
         self._last_applied = 0.0
         self._last_size_read = 0.0
+        # Ultimo rettangolo comunicato al sistema: se non e' cambiato,
+        # non c'e' nulla da riallineare.
+        self._last_props: tuple | None = None
+        # Vero quando la finestra di origine e' ridotta a icona.
+        self._source_iconic = False
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
         self._refresh_timer.timeout.connect(self._apply_refresh)
@@ -279,6 +290,8 @@ class CallView(QWidget):
 
     def clear(self) -> None:
         self._refresh_timer.stop()
+        self._last_props = None
+        self._source_iconic = False
         if self._thumbnail is not None:
             try:
                 ctypes.windll.dwmapi.DwmUnregisterThumbnail(self._thumbnail)
@@ -388,6 +401,20 @@ class CallView(QWidget):
             return
         try:
             self._read_source_size()
+            rect = self._destination_rect()
+            # Il rettangolo e' espresso nelle coordinate della NOSTRA
+            # finestra: spostarla sullo schermo non lo cambia di un solo
+            # pixel. Eppure ogni spostamento chiedeva al sistema un
+            # riallineamento completo — decine al secondo trascinando la
+            # finestra — e su un computer che compone le miniature con il
+            # processore ognuna di quelle richieste faceva scattare il
+            # video. Se non e' cambiato nulla, non si chiede nulla.
+            chiave = (
+                rect.left, rect.top, rect.right, rect.bottom,
+                bool(self.isVisible()) and not self._source_iconic,
+            )
+            if chiave == self._last_props:
+                return
             properties = _ThumbnailProperties()
             properties.dwFlags = (
                 DWM_TNP_RECTDESTINATION
@@ -395,15 +422,44 @@ class CallView(QWidget):
                 | DWM_TNP_OPACITY
                 | DWM_TNP_SOURCECLIENTAREAONLY
             )
-            properties.rcDestination = self._destination_rect()
+            properties.rcDestination = rect
             properties.opacity = 255
-            properties.fVisible = bool(self.isVisible())
+            properties.fVisible = chiave[4]
             properties.fSourceClientAreaOnly = True
             ctypes.windll.dwmapi.DwmUpdateThumbnailProperties(
                 self._thumbnail, ctypes.byref(properties)
             )
+            self._last_props = chiave
         except Exception:
             log.debug("Aggiornamento della miniatura non riuscito", exc_info=True)
+
+    def poll_source_state(self) -> None:
+        """
+        Si accorge della finestra di origine ridotta a icona.
+
+        Il sistema smette di comporre una finestra ridotta a icona: la
+        miniatura resta congelata sull'ultimo fotogramma, senza alcun
+        segnale. Chi guardava l'anteprima vedeva il video "bloccato" e
+        nessuna spiegazione. Due chiamate al sistema ogni pochi secondi
+        bastano per accorgersene, nascondere la miniatura e scrivere il
+        perche' al suo posto — e per rimettere tutto a posto da soli
+        quando la finestra viene ripristinata.
+        """
+        if self._thumbnail is None or self._source is None or not IS_WINDOWS:
+            return
+        try:
+            iconica = bool(
+                ctypes.windll.user32.IsIconic(wintypes.HWND(self._source.handle))
+            )
+        except Exception:
+            return
+        if iconica == self._source_iconic:
+            return
+        self._source_iconic = iconica
+        if iconica:
+            log.info("La finestra della videochiamata e' stata ridotta a icona")
+        self._apply_refresh()
+        self.update()
 
     def set_visible_thumbnail(self, visible: bool) -> None:
         """Nasconde la miniatura senza perdere la finestra selezionata."""
@@ -416,6 +472,9 @@ class CallView(QWidget):
             ctypes.windll.dwmapi.DwmUpdateThumbnailProperties(
                 self._thumbnail, ctypes.byref(properties)
             )
+            # La visibilita' e' cambiata fuori da _apply_refresh: il
+            # rettangolo ricordato non descrive piu' lo stato reale.
+            self._last_props = None
         except Exception:
             pass
 
@@ -443,6 +502,16 @@ class CallView(QWidget):
         painter.setBrush(QColor("#141b26"))
         painter.setPen(Qt.NoPen)
         painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 8, 8)
+
+        if self._thumbnail is not None and self._source_iconic:
+            painter.setPen(QPen(QColor("#8b97a8")))
+            painter.drawText(
+                self.rect().adjusted(20, 20, -20, -20), Qt.AlignCenter,
+                "La finestra della videochiamata e' ridotta a icona.\n\n"
+                "Ripristinala dalla barra delle applicazioni per\n"
+                "rivedere qui l'anteprima dal vivo.",
+            )
+            return
 
         if self._thumbnail is not None:
             return  # il contenuto lo disegna il sistema

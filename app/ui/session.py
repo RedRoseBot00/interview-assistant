@@ -79,11 +79,19 @@ class InterviewSession(QObject):
     # Callback provenienti dai thread audio/trascrizione
     # ------------------------------------------------------------------
     def _handle_level(self, speaker: str, level: float) -> None:
+        # Stessa protezione degli altri: questo arriva dal thread audio
+        # e puo' arrivare dopo che la finestra ha buttato via la
+        # sessione. Era l'unico rimasto senza guardia.
+        if self._detached:
+            return
         now = time.monotonic()
         if now - self._last_level_emit.get(speaker, 0.0) < LEVEL_EMIT_INTERVAL:
             return
         self._last_level_emit[speaker] = now
-        self.level_changed.emit(speaker, level)
+        try:
+            self.level_changed.emit(speaker, level)
+        except RuntimeError:
+            self.detach()
 
     # Questi tre metodi vengono chiamati DA ALTRI THREAD, e possono
     # arrivare dopo che la finestra ha gia' buttato via la sessione: se

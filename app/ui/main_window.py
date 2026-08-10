@@ -1482,8 +1482,22 @@ class MainWindow(QMainWindow):
         # al riavvio del programma.
         try:
             if self.call_view.source is not None and not self.call_view.source_alive():
-                self.call_view.refresh()
+                # clear(), non refresh(): refresh() non fa nulla quando il
+                # riquadro non e' a schermo — per esempio mentre si legge
+                # il report — e cosi' la sorgente morta non veniva mai
+                # dimenticata. Ogni otto secondi, per sempre, si
+                # rileggevano tutte le finestre del computer sul filo che
+                # disegna l'interfaccia: uno scatto periodico costante.
+                # Con clear() la sorgente sparisce e questo ramo non si
+                # ripete piu'.
+                self.call_view.clear()
                 self._refresh_window_list()
+            else:
+                # La finestra ridotta a icona non viene piu' composta dal
+                # sistema: la miniatura resta congelata sull'ultimo
+                # fotogramma, senza che nulla lo dica. Era il "video
+                # bloccato" visto sul campo.
+                self.call_view.poll_source_state()
         except Exception:
             log.debug("Controllo dell'anteprima non riuscito", exc_info=True)
 
