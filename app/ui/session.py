@@ -103,29 +103,46 @@ class InterviewSession(QObject):
     # colpo il thread di trascrizione, portandosi via tutte le frasi
     # ancora da elaborare. Un segnale che non trova piu' nessuno non e'
     # un guasto: e' semplicemente troppo tardi, e va lasciato cadere.
+    def _gone(self, exc: RuntimeError) -> bool:
+        """
+        Distingue "l'oggetto grafico non esiste piu'" da ogni altro
+        RuntimeError. Il distacco e' PERMANENTE: sganciarsi per un
+        errore qualsiasi — perfino un RecursionError, che di RuntimeError
+        e' sottoclasse — avrebbe spento sottotitoli e indicatori per
+        sempre a causa di un guasto passeggero.
+        """
+        if "already deleted" in str(exc).lower():
+            self.detach()
+            return True
+        log.exception("Emissione di un segnale fallita per un errore inatteso")
+        return False
+
     def _handle_segment(self, segment: TranscriptSegment) -> None:
         if self._detached:
             return
+        # to_dict() sta FUORI dalla protezione: un suo errore e' un
+        # guasto da conoscere, non un motivo per sganciare l'interfaccia.
+        dati = segment.to_dict()
         try:
-            self.segment_received.emit(segment.to_dict())
-        except RuntimeError:
-            self.detach()
+            self.segment_received.emit(dati)
+        except RuntimeError as exc:
+            self._gone(exc)
 
     def _handle_status(self, message: str) -> None:
         if self._detached:
             return
         try:
             self.status_changed.emit(message)
-        except RuntimeError:
-            self.detach()
+        except RuntimeError as exc:
+            self._gone(exc)
 
     def _handle_engine_error(self, exc: Exception) -> None:
         if self._detached:
             return
         try:
             self.error_raised.emit(str(exc))
-        except RuntimeError:
-            self.detach()
+        except RuntimeError as errore:
+            self._gone(errore)
 
     def _handle_audio_error(self, speaker: str, exc: Exception) -> None:
         if self._detached:
@@ -134,8 +151,8 @@ class InterviewSession(QObject):
             self.warning_raised.emit(
                 f"La sorgente audio '{speaker}' si e' interrotta: {exc}"
             )
-        except RuntimeError:
-            self.detach()
+        except RuntimeError as errore:
+            self._gone(errore)
 
     def detach(self) -> None:
         """

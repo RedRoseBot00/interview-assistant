@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
 
 from app import compat, config, platform_detect, settings
 from app.audio import echo as echo_module
+from app.models import download as model_download
 from app.export.report import export_docx, export_txt
 from app.storage import db
 from app.ui import theme
@@ -106,6 +107,8 @@ class MainWindow(QMainWindow):
         self._ultimo_salvato: tuple | None = None
         # Interventi arrivati mentre i sottotitoli erano nascosti.
         self._segmenti_nascosti = 0
+        # Il ripiego sul modello precedente si tenta una volta sola.
+        self._preparation_fallback_done = False
 
         db.init_db()
 
@@ -859,7 +862,13 @@ class MainWindow(QMainWindow):
 
     def _start_preparation(self) -> None:
         if self.startup_worker is not None and self.startup_worker.isRunning():
-            return
+            # Prima si tornava indietro in silenzio: chi cambiava modello
+            # dalle impostazioni durante la preparazione iniziale vedeva
+            # "preparo il modello scelto", ma il lavoro in corso
+            # continuava con quello VECCHIO — e il nuovo non veniva mai
+            # scaricato. Il lavoro vecchio va fermato e sostituito.
+            self.startup_worker.cancel()
+            self.startup_worker.wait(8000)
 
         self.record_button.setEnabled(False)
         self.retest_button.setEnabled(False)
@@ -886,6 +895,18 @@ class MainWindow(QMainWindow):
             self.progress_bar.setRange(0, 0)
 
     def _on_ready(self, compatible_mode: bool, message: str) -> None:
+        if compatible_mode:
+            # Va applicata ADESSO, non solo al prossimo avvio: il test ha
+            # appena scoperto che i kernel veloci uccidono il processo, e
+            # il motore verra' caricato in QUESTO processo al primo
+            # colloquio. Senza questa riga, sul primo avvio di un
+            # computer senza AVX2 l'app moriva a colloquio in corso —
+            # portandosi via la registrazione — e funzionava solo dal
+            # riavvio successivo.
+            try:
+                compat.apply_cpu_compat(True)
+            except Exception:
+                log.debug("Compatibilita' CPU non applicabile ora", exc_info=True)
         self.progress_bar.setVisible(False)
         self.progress_bar.setRange(0, 100)
         self.engine_ready = True
@@ -897,7 +918,45 @@ class MainWindow(QMainWindow):
         )
         if message:
             self._add_warning(message)
+        self._ask_model_switch()
         self._check_model_accuracy()
+
+    def _ask_model_switch(self) -> None:
+        """
+        Chiede se passare al modello consigliato dalla taratura.
+
+        Vale solo quando il modello attuale l'ha scelto l'utente: la sua
+        scelta non si scavalca, ma un avviso passivo in mezzo agli altri
+        veniva ignorato — e il colloquio partiva comunque con un modello
+        che il cronometro dava per perdente. Una domanda con Si'/No no.
+        """
+        consigliato = settings.get("pending_model_advice", "")
+        attuale = settings.get("whisper_model_size", "small")
+        if not consigliato or consigliato == attuale:
+            return
+        # In ogni caso la domanda si fa una volta: alla prossima
+        # taratura, se serve ancora, verra' rifatta.
+        settings.set("pending_model_advice", "")
+        velocita = float(settings.get("engine_speed_seconds", 0.0) or 0.0)
+        quanto = (
+            f"circa {velocita:.0f} secondi per trascrivere ogni frase"
+            if velocita >= 1.5 else "piu' del ritmo del parlato"
+        )
+        risposta = QMessageBox.question(
+            self,
+            "Modello di trascrizione",
+            f"Con il modello '{attuale}' questo computer impiega {quanto}: "
+            f"i sottotitoli restano sempre piu' indietro.\n\n"
+            f"Vuoi passare al modello '{consigliato}', che regge il ritmo "
+            f"di un dialogo su questo computer?\n\n"
+            f"Potrai tornare indietro in ogni momento dalle impostazioni.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if risposta != QMessageBox.Yes:
+            return
+        settings.set_many({"whisper_model_size": consigliato}, explicit=True)
+        self._start_preparation()
 
     def _check_model_accuracy(self) -> None:
         """Avverte se e' in uso uno dei modelli meno precisi."""
@@ -911,6 +970,28 @@ class MainWindow(QMainWindow):
         )
 
     def _on_preparation_failed(self, message: str, detail: str) -> None:
+        # Se il guasto riguarda un modello appena scelto e non ancora
+        # scaricato (niente rete, disco pieno), il programma non deve
+        # restare bloccato: sul disco c'e' ancora un modello funzionante.
+        # Si ripiega su quello, UNA volta sola, avvisando chiaramente.
+        scelto = settings.get("whisper_model_size", "small")
+        if not self._preparation_fallback_done and not model_download.whisper_model_present(scelto):
+            from app.transcription.engine import MODEL_LADDER
+
+            presente = next(
+                (m for m in MODEL_LADDER if model_download.whisper_model_present(m)),
+                None,
+            )
+            if presente is not None:
+                self._preparation_fallback_done = True
+                settings.set("whisper_model_size", presente)
+                self._add_warning(
+                    f"Il modello '{scelto}' non e' scaricabile in questo "
+                    f"momento: continuo con '{presente}'. Riprova il cambio "
+                    "quando la connessione funziona."
+                )
+                self._start_preparation()
+                return
         self.progress_bar.setVisible(False)
         self.engine_ready = False
         self.record_button.setEnabled(False)
@@ -985,6 +1066,11 @@ class MainWindow(QMainWindow):
         # allo stesso modo, non deve trascinarsi dal colloquio prima.
         self._ultimo_salvato = None
         self._segmenti_nascosti = 0
+        # I sottotitoli ripartono sempre accesi: chi li aveva nascosti
+        # nel colloquio precedente (per condividere lo schermo) si
+        # ritrovava il colloquio nuovo muto senza ricordarsi il perche'.
+        if not self.captions_button.isChecked():
+            self.captions_button.setChecked(True)
         self.export_docx_button.setEnabled(False)
         self.export_txt_button.setEnabled(False)
         self.report_button.setEnabled(False)
@@ -1757,32 +1843,71 @@ class MainWindow(QMainWindow):
             return
 
         labels = self._labels()
-        lines = [
-            f"Candidato: {interview.candidate_name}",
-            f"Posizione: {interview.role or 'non indicata'}",
-            f"Data: {interview.display_date}",
-            f"Durata: {int(interview.duration_seconds // 60)} min",
+
+        # Il dettaglio usa gli stessi colori della schermata principale:
+        # chi conduce in ambra, il candidato in blu. Prima era un blocco
+        # di testo uniforme in cui le battute dei due si confondevano
+        # con il report e fra loro.
+        def _riga(chiave: str, valore: str) -> str:
+            return (
+                f'<div style="margin-bottom:2px">'
+                f'<span style="color:{theme.TEXT_MUTED}">{html.escape(chiave)}:</span> '
+                f'<span style="color:{theme.TEXT}">{html.escape(valore)}</span></div>'
+            )
+
+        def _titolo(testo: str) -> str:
+            return (
+                f'<div style="margin:14px 0 6px 0;font-weight:700;'
+                f'font-size:13px;letter-spacing:1px;color:{theme.TEXT_MUTED}">'
+                f"{html.escape(testo)}</div>"
+            )
+
+        parti = [
+            _riga("Candidato", interview.candidate_name),
+            _riga("Posizione", interview.role or "non indicata"),
+            _riga("Data", interview.display_date),
+            _riga("Durata", f"{int(interview.duration_seconds // 60)} min"),
         ]
         if interview.experience:
-            lines.append(f"Esperienza: {interview.experience}")
+            parti.append(_riga("Esperienza", interview.experience))
         if interview.skills:
-            lines.append(f"Competenze: {interview.skills}")
-        lines += [
-            "",
-            "=== REPORT ===",
-            interview.report or "(report non generato)",
-        ]
+            parti.append(_riga("Competenze", interview.skills))
+
+        parti.append(_titolo("REPORT"))
+        report = interview.report or "(report non generato)"
+        parti.append(
+            f'<div style="color:{theme.TEXT};white-space:pre-wrap">'
+            f"{html.escape(report)}</div>"
+        )
         if interview.notes:
-            lines += ["", "=== NOTE ===", interview.notes]
-        lines += ["", "=== TRASCRIZIONE ==="]
+            parti.append(_titolo("NOTE"))
+            parti.append(
+                f'<div style="color:{theme.TEXT};white-space:pre-wrap">'
+                f"{html.escape(interview.notes)}</div>"
+            )
+
+        parti.append(_titolo("TRASCRIZIONE"))
         if interview.segments:
-            lines += [
-                f"{labels.get(s.get('speaker', ''), s.get('speaker', ''))}: {s.get('text', '')}"
-                for s in interview.segments
-            ]
+            for seg in interview.segments:
+                # Un elemento malformato non deve far sparire il resto.
+                if not isinstance(seg, dict):
+                    continue
+                chi = seg.get("speaker", "")
+                nome = labels.get(chi, chi)
+                colore = theme.SPEAKER_COLORS.get(chi, theme.TEXT)
+                testo = html.escape(str(seg.get("text") or ""))
+                parti.append(
+                    f'<div style="margin-bottom:7px">'
+                    f'<span style="color:{colore};font-weight:600">'
+                    f"{html.escape(str(nome))}</span>"
+                    f'<span style="color:{theme.TEXT}"> — {testo}</span></div>'
+                )
         else:
-            lines.append(interview.transcript)
-        self.history_detail.setPlainText("\n".join(lines))
+            parti.append(
+                f'<div style="color:{theme.TEXT};white-space:pre-wrap">'
+                f"{html.escape(interview.transcript)}</div>"
+            )
+        self.history_detail.setHtml("".join(parti))
 
     def _export_from_history(self) -> None:
         interview = self._selected_history_interview()

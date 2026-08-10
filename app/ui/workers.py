@@ -92,8 +92,12 @@ class StartupWorker(QThread):
         if ideale == self.whisper_size:
             return ""
 
-        # La scelta esplicita dell'utente non si tocca mai: si consiglia.
+        # La scelta esplicita dell'utente non si tocca mai: si consiglia,
+        # e si lascia alla finestra il compito di CHIEDERE, una volta,
+        # se cambiare. Un avviso passivo veniva ignorato; una domanda
+        # con Si'/No no.
         if "whisper_model_size" in (settings.get("user_choices") or ()):
+            settings.set("pending_model_advice", ideale)
             return (
                 f"Questo computer impiega circa {call_seconds:.0f} secondi per "
                 f"trascrivere una frase con il modello '{self.whisper_size}': "

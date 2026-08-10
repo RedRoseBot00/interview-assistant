@@ -48,7 +48,8 @@ QMainWindow, QTabWidget::pane {{
 
 /* ---- Intestazione ---- */
 #HeaderBar {{
-    background: {HEADER_BG};
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                stop:0 #1b2433, stop:1 #243247);
     min-height: 62px;
 }}
 #HeaderTitle {{
@@ -92,7 +93,7 @@ QLabel.SkillChip {{
 QFrame.Card {{
     background: {CARD_BG};
     border: 1px solid {BORDER};
-    border-radius: 10px;
+    border-radius: 12px;
 }}
 QLabel.CardTitle {{
     font-size: 15px;
@@ -110,40 +111,48 @@ QLabel.Metric {{
 
 /* ---- Pulsanti ---- */
 QPushButton {{
-    background: #eef1f5;
-    border: 1px solid {BORDER};
-    border-radius: 7px;
+    background: #ffffff;
+    border: 1px solid #d6dbe3;
+    border-radius: 8px;
     padding: 8px 16px;
     font-weight: 600;
 }}
-QPushButton:hover {{ background: #e4e8ee; }}
-QPushButton:disabled {{ color: #a3aab5; background: #f2f4f7; }}
+QPushButton:hover {{ background: #f3f6fa; border-color: #c3cbd6; }}
+QPushButton:pressed {{ background: #e8edf4; }}
+QPushButton:disabled {{ color: #a3aab5; background: #f2f4f7; border-color: {BORDER}; }}
+QPushButton:focus {{ border-color: {ACCENT}; outline: none; }}
 
 QPushButton#PrimaryStart {{
-    background: {SUCCESS};
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 #19ad55, stop:1 {SUCCESS});
     border: none;
     color: #ffffff;
 }}
 QPushButton#PrimaryStart:hover {{ background: #15803d; }}
+QPushButton#PrimaryStart:pressed {{ background: #126c34; }}
 QPushButton#PrimaryStart:disabled {{ background: #a7d6b8; color: #f0fdf4; }}
 
 QPushButton#StopButton {{
-    background: {DANGER};
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 #e23434, stop:1 {DANGER});
     border: none;
     color: #ffffff;
 }}
 QPushButton#StopButton:hover {{ background: #b91c1c; }}
+QPushButton#StopButton:pressed {{ background: #a01818; }}
 /* Senza questa riga il pulsante restava rosso pieno anche da
    disattivato: durante lo smaltimento della coda — che dura decine di
    secondi — sembrava premibile, e l'utente lo cliccava a vuoto. */
 QPushButton#StopButton:disabled {{ background: #eda3a3; color: #fff5f5; }}
 
 QPushButton#AccentButton {{
-    background: {ACCENT};
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 #3272f2, stop:1 {ACCENT});
     border: none;
     color: #ffffff;
 }}
 QPushButton#AccentButton:hover {{ background: #1d4ed8; }}
+QPushButton#AccentButton:pressed {{ background: #1a44be; }}
 QPushButton#AccentButton:disabled {{ background: #b6c8ee; color: #eff4ff; }}
 
 QPushButton#DangerButton {{
@@ -159,7 +168,7 @@ QPushButton#DangerButton:disabled {{
 }}
 
 QPushButton:checked {{
-    background: #dfe7f5;
+    background: #e8f0fe;
     border-color: {ACCENT};
     color: {ACCENT};
 }}
@@ -171,24 +180,109 @@ QPushButton:checked {{
 QLineEdit, QComboBox, QSpinBox {{
     background: #ffffff;
     border: 1px solid {BORDER};
-    border-radius: 7px;
+    border-radius: 8px;
     padding: 6px 9px;
     min-height: 22px;
     selection-background-color: {ACCENT};
+    selection-color: #ffffff;
 }}
+QLineEdit:hover, QComboBox:hover, QSpinBox:hover {{ border-color: #c3cbd6; }}
 /* Il testo non deve toccare gli angoli arrotondati del riquadro. */
 QTextEdit, QPlainTextEdit {{
     background: #ffffff;
     border: 1px solid {BORDER};
-    border-radius: 7px;
+    border-radius: 8px;
     padding: 6px 8px;
     selection-background-color: {ACCENT};
+    selection-color: #ffffff;
 }}
-QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QComboBox:focus {{
-    border-color: {ACCENT};
+QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus,
+QComboBox:focus, QSpinBox:focus {{
+    border: 1px solid {ACCENT};
 }}
-QComboBox::drop-down {{ border: none; width: 20px; }}
 QLabel {{ background: transparent; }}
+
+/* ---- Menu a tendina ---- */
+QComboBox::drop-down {{
+    border: none;
+    width: 26px;
+}}
+QComboBox::down-arrow {{
+    /* Triangolino disegnato con i bordi: niente immagini esterne. */
+    width: 0; height: 0;
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-top: 6px solid #8b95a5;
+    margin-right: 8px;
+}}
+QComboBox::down-arrow:on {{ border-top-color: {ACCENT}; }}
+/* L'elenco che si apre: stesso linguaggio del resto, voci spaziose,
+   selezione morbida invece del blu pieno di sistema. */
+QComboBox QAbstractItemView {{
+    background: #ffffff;
+    border: 1px solid #c9d0da;
+    border-radius: 8px;
+    padding: 4px;
+    outline: none;
+    selection-background-color: transparent;
+}}
+QComboBox QAbstractItemView::item {{
+    padding: 8px 10px;
+    border-radius: 6px;
+    color: {TEXT};
+}}
+QComboBox QAbstractItemView::item:hover {{ background: #f0f4fa; }}
+QComboBox QAbstractItemView::item:selected {{
+    background: #e8f0fe;
+    color: {ACCENT};
+}}
+
+/* ---- Menu contestuali (tasto destro, menu della finestra) ---- */
+QMenu {{
+    background: #ffffff;
+    border: 1px solid #c9d0da;
+    border-radius: 8px;
+    padding: 5px;
+}}
+QMenu::item {{
+    padding: 7px 26px 7px 14px;
+    border-radius: 6px;
+}}
+QMenu::item:selected {{ background: #e8f0fe; color: {ACCENT}; }}
+QMenu::item:disabled {{ color: #a3aab5; }}
+QMenu::separator {{
+    height: 1px;
+    background: {BORDER};
+    margin: 5px 8px;
+}}
+
+/* ---- Suggerimenti al passaggio del mouse ---- */
+QToolTip {{
+    background: #1e2836;
+    color: #f3f4f6;
+    border: none;
+    border-radius: 6px;
+    padding: 6px 9px;
+    font-size: 12px;
+}}
+
+/* ---- Caselle di spunta ---- */
+QCheckBox {{ spacing: 8px; }}
+QCheckBox::indicator {{
+    width: 17px; height: 17px;
+    border: 1px solid #c3cbd6;
+    border-radius: 5px;
+    background: #ffffff;
+}}
+QCheckBox::indicator:hover {{ border-color: {ACCENT}; }}
+QCheckBox::indicator:checked {{
+    background: {ACCENT};
+    border-color: {ACCENT};
+    /* Segno di spunta senza immagini: due bordi bianchi ruotati non si
+       possono fare in QSS, quindi il riquadro pieno col bordo bianco
+       interno resta il compromesso piu' pulito. */
+}}
+QCheckBox::indicator:checked:hover {{ background: #1d4ed8; }}
 
 /* Il cronometro va letto con la coda dell'occhio mentre si parla con
    il candidato: la regola generale sui caratteri lo riporterebbe alla
@@ -204,21 +298,25 @@ QLabel {{ background: transparent; }}
 QListWidget {{
     background: #ffffff;
     border: 1px solid {BORDER};
-    border-radius: 8px;
+    border-radius: 10px;
     padding: 4px;
+    outline: none;
 }}
 QListWidget::item {{ padding: 9px 8px; border-radius: 6px; }}
+QListWidget::item:hover {{ background: #f0f4fa; }}
 QListWidget::item:selected {{ background: #e8f0fe; color: {TEXT}; }}
 
 /* ---- Schede a tab ---- */
 QTabBar::tab {{
     background: transparent;
-    padding: 9px 18px;
+    padding: 10px 18px;
     margin-right: 4px;
     border: none;
+    border-bottom: 2px solid transparent;
     color: {TEXT_MUTED};
     font-weight: 600;
 }}
+QTabBar::tab:hover {{ color: {TEXT}; }}
 QTabBar::tab:selected {{
     color: {ACCENT};
     border-bottom: 2px solid {ACCENT};
@@ -236,14 +334,48 @@ QProgressBar {{
     text-align: center;
     color: transparent;
 }}
-QProgressBar::chunk {{ background: {ACCENT}; border-radius: 5px; }}
+QProgressBar::chunk {{
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                stop:0 {ACCENT}, stop:1 #3b82f6);
+    border-radius: 5px;
+}}
 
-QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
-QScrollBar::handle:vertical {{ background: #cfd5dd; border-radius: 5px; min-height: 28px; }}
-QScrollBar::handle:vertical:hover {{ background: #b6bec9; }}
-QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
+/* ---- Barre di scorrimento ---- */
+QScrollBar:vertical {{
+    background: transparent;
+    width: 10px;
+    margin: 2px;
+}}
+QScrollBar::handle:vertical {{
+    background: #cfd5dd;
+    border-radius: 4px;
+    min-height: 28px;
+}}
+QScrollBar::handle:vertical:hover {{ background: #aeb7c3; }}
+QScrollBar::handle:vertical:pressed {{ background: #94a0af; }}
+QScrollBar:horizontal {{
+    background: transparent;
+    height: 10px;
+    margin: 2px;
+}}
+QScrollBar::handle:horizontal {{
+    background: #cfd5dd;
+    border-radius: 4px;
+    min-width: 28px;
+}}
+QScrollBar::handle:horizontal:hover {{ background: #aeb7c3; }}
+QScrollBar::handle:horizontal:pressed {{ background: #94a0af; }}
+QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
+QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
+
+/* ---- Separatori trascinabili ---- */
+QSplitter::handle {{ background: transparent; }}
+QSplitter::handle:hover {{ background: #dfe5ec; }}
+
+/* ---- Finestre di dialogo ---- */
+QMessageBox {{ background: {CARD_BG}; }}
+QMessageBox QPushButton {{ min-width: 86px; }}
 """
-
 
 # --------------------------------------------------------------------------
 # Componenti riutilizzabili
@@ -322,7 +454,12 @@ class LevelMeter(QWidget):
     def set_level(self, value: float) -> None:
         # Scala logaritmica: la voce umana occupa una porzione ridotta
         # della scala lineare e la barra sembrerebbe sempre ferma.
-        if value <= 0:
+        #
+        # Un NaN — un driver puo' consegnare un blocco vuoto e la media
+        # di zero campioni non e' un numero — superava ogni confronto e
+        # inchiodava la barra a fondo scala: la rassicurazione "mi sta
+        # sentendo" diventava una bugia fissa.
+        if not math.isfinite(value) or value <= 0:
             normalised = 0.0
         else:
             db = 20 * math.log10(max(value, 1e-6))
