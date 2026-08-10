@@ -57,10 +57,15 @@ REFERENCE_WAIT_SECONDS = 1.2
 MERGE_GAP_SECONDS = 1.5
 MERGE_MAX_SECONDS = 26.0
 MERGE_LOOKAHEAD = 32
+# Sovrapposizione massima ammessa quando si riattacca il seguito di una
+# frase troncata: e' il pre-roll che il rilevatore di voce conserva
+# davanti a ogni frase (0,30 s), piu' un margine.
+MERGE_CONTINUATION_OVERLAP = 0.45
 # Quanto parlato si puo' tenere da parte per l'accorpamento. Serve solo
 # a riempire una finestra da ventisei secondi: tutto cio' che eccede e'
-# tempo sottratto al conteggio dell'arretrato senza alcun vantaggio.
-LOOKAHEAD_MAX_SECONDS = 30.0
+# tempo sottratto al conteggio dell'arretrato senza alcun vantaggio, e
+# allarga il tetto reale dell'attesa oltre quello dichiarato.
+LOOKAHEAD_MAX_SECONDS = MERGE_MAX_SECONDS
 
 # Quando la coda cresce, l'unica cosa che conta e' tornare al presente:
 # si accorpa fino al limite di durata ignorando la lunghezza delle
@@ -97,6 +102,18 @@ MODEL_LADDER = ("medium", "small", "base", "tiny")
 # per arrivare da 'small' a 'tiny', che e' il caso delle macchine
 # virtuali a due core; di piu' sarebbe solo altalena.
 MAX_DOWNGRADES = 2
+# Corsia d'emergenza: quando una chiamata costa piu' di questo multiplo
+# dell'audio che contiene, si scende dopo appena due conferme invece di
+# aspettarne otto — che sul computer misurato sul campo significava
+# decidere dopo la fine del colloquio.
+FAST_OVERLOAD_CALLS = 2
+FAST_OVERLOAD_FACTOR = 2.5
+
+# Finestra di analisi del riconoscimento, in secondi. Trenta e' il
+# valore su cui il modello e' addestrato; sotto i dieci la resa degrada
+# sensibilmente e non si scende mai.
+ENCODER_WINDOW_FULL = 30
+ENCODER_WINDOW_MIN = 10
 
 # Ogni quante frasi lunghe si lascia il modello libero di ridire la sua
 # sulla lingua, per potersi ricredere su un blocco iniziale sbagliato.
@@ -109,6 +126,12 @@ LANGUAGE_PROBE_UNCONFIRMED = 2
 # lingua. Sotto, il riconoscimento non e' affidabile e la frase verrebbe
 # soltanto rovinata.
 LANGUAGE_PROBE_MIN_SECONDS = 4.0
+# Fiducia minima per ADOTTARE una lingua come ipotesi provvisoria. E'
+# volutamente bassa: un'ipotesi anche mediocre e' molto meglio di
+# nessuna, perche' senza lingua ogni chiamata decodifica in quella
+# indovinata a caso su due secondi di audio. L'ipotesi resta comunque
+# in discussione a ogni sonda.
+LANGUAGE_ADOPT_PROBABILITY = 0.5
 
 # Quanto tempo si concede alla trascrizione per recuperare l'arretrato
 # dopo che l'utente ha premuto "Termina colloquio". Oltre, si abbandona
@@ -804,17 +827,26 @@ class TranscriptionEngine:
                 except Exception:
                     log.debug("Avviso di silenzio non elaborato", exc_info=True)
                 continue
-            if (
-                successiva.speaker != chunk.speaker
-                or successiva.continues_previous
-            ):
+            if successiva.speaker != chunk.speaker:
                 break
 
             pausa = successiva.offset - fine
             durata_totale = (
                 successiva.offset + successiva.samples.size / rate - chunk.offset
             )
-            if pausa < -0.05 or pausa > pausa_massima:
+            # Il SEGUITO di una frase troncata per durata massima e' lo
+            # stesso parlato che continua: e' il candidato ad accorpare
+            # per eccellenza. Prima veniva escluso — e comunque la sua
+            # sovrapposizione di pre-roll faceva scattare il limite sulla
+            # pausa negativa — cosi' una risposta di quaranta secondi
+            # restava spezzata in quattro chiamate da dieci: proprio sul
+            # caso piu' comune di un colloquio, il candidato che
+            # racconta, l'accorpamento era spento. La sovrapposizione
+            # viene tolta dal ramo dei campioni doppi qui sotto.
+            if successiva.continues_previous:
+                if pausa < -(MERGE_CONTINUATION_OVERLAP + 0.1):
+                    break
+            elif pausa < -0.05 or pausa > pausa_massima:
                 break
             if durata_totale > MERGE_MAX_SECONDS:
                 break
@@ -976,6 +1008,18 @@ class TranscriptionEngine:
         started = time.monotonic()
         segments, info = self._model.transcribe(
             audio,
+            # La finestra di analisi. Il riconoscimento riempie SEMPRE la
+            # finestra di silenzio: con quella intera da trenta secondi,
+            # una frase di quattro paga l'analisi di ventisei secondi di
+            # nulla — ed e' l'analisi, non la scrittura del testo, a
+            # dominare il costo su un computer lento. Quando il computer
+            # e' in affanno conclamato la finestra viene ritagliata
+            # sull'audio vero: due-tre volte meno lavoro a chiamata.
+            # ATTENZIONE a chi tocca questo codice: la libreria RICORDA
+            # l'ultimo valore ricevuto, quindi va passato SEMPRE, anche
+            # quando e' quello normale — ometterlo non significa "usa il
+            # valore normale" ma "usa l'ultimo che ti ho detto".
+            chunk_length=self._encoder_window(duration),
             language=lingua_chiamata,
             # Ampiezza della ricerca e scala dei tentativi decise in base
             # a quanto il computer sta al passo: vedi _decoding_quality.
@@ -1121,6 +1165,29 @@ class TranscriptionEngine:
         with self._lock:
             self._last_text.pop(speaker, None)
 
+    def _encoder_window(self, duration: float) -> int:
+        """
+        Secondi di finestra da chiedere all'analisi per questa chiamata.
+
+        Il valore addestrato e' trenta, e trenta resta finche' il
+        computer regge: accorciare la finestra e' una rinuncia di
+        qualita' piccola ma non nulla, e non va fatta gratis. Quando
+        pero' il computer e' gia' dovuto scendere di modello, o il costo
+        di una chiamata supera comunque il ritmo del dialogo, la
+        priorita' e' una sola: stare al passo. La finestra viene allora
+        ritagliata sull'audio vero, con un margine, mai sotto i dieci
+        secondi.
+        """
+        in_affanno = self._downgraded > 0 or (
+            self._call_cost > 0
+            and self._arrival_gap > 0
+            and self._call_cost > self._arrival_gap
+        )
+        if not in_affanno:
+            return ENCODER_WINDOW_FULL
+        finestra = int(np.ceil(duration)) + 2
+        return int(min(ENCODER_WINDOW_FULL, max(ENCODER_WINDOW_MIN, finestra)))
+
     def _decoding_quality(self) -> tuple[int, tuple[float, ...], int]:
         """
         Quanta cura mettere nella trascrizione del prossimo blocco.
@@ -1244,6 +1311,24 @@ class TranscriptionEngine:
         """
         if self._language_forced or not detected or not libera:
             return
+
+        # ADOTTARE un'ipotesi provvisoria costa poco e rende molto: senza
+        # una lingua, ogni chiamata decodifica in quella indovinata a
+        # caso sul momento. Le soglie severe qui sotto pretendono cinque
+        # parole di testo sensato — ma il testo sensato arriva solo SE la
+        # lingua e' giusta: un circolo vizioso in cui l'ipotesi non si
+        # agganciava mai e tutto il colloquio usciva in lingue a caso.
+        # Per l'adozione basta quindi un verdetto appena decente: viene
+        # comunque rimesso in discussione ogni due frasi lunghe.
+        if (
+            self._locked_language is None
+            and duration >= config.LANGUAGE_VOTE_MIN_SECONDS
+            and probability >= LANGUAGE_ADOPT_PROBABILITY
+        ):
+            self._locked_language = detected
+            self._probe_countdown = 0
+            log.info("Lingua provvisoria del colloquio: '%s'", detected)
+
         if not self._vote_is_trustworthy(detected, probability, duration, words):
             return
 
@@ -1334,6 +1419,22 @@ class TranscriptionEngine:
         else:
             self.realtime_factor = 0.8 * self.realtime_factor + 0.2 * factor
         self._speed_samples += 1
+
+        # Corsia d'emergenza. La valutazione ordinaria aspetta otto
+        # chiamate: sul computer misurato sul campo — dieci secondi a
+        # chiamata — significava decidere DOPO la fine di un colloquio di
+        # novanta secondi, a parlato ormai buttato. Ma quando una singola
+        # chiamata costa due volte e mezzo l'audio che contiene non c'e'
+        # niente da aspettare: la seconda conferma basta, e si scende
+        # subito.
+        if (
+            self._downgraded < MAX_DOWNGRADES
+            and self._speed_samples >= FAST_OVERLOAD_CALLS
+            and elapsed > FAST_OVERLOAD_FACTOR * max(audio_seconds, 1.0)
+        ):
+            self._consider_lighter_model(emergenza=True)
+            return
+
         self._consider_lighter_model()
 
     # ------------------------------------------------------------------
@@ -1350,37 +1451,48 @@ class TranscriptionEngine:
             return 0.0
         return self._call_cost / self._arrival_gap
 
-    def _consider_lighter_model(self) -> None:
+    def _consider_lighter_model(self, emergenza: bool = False) -> None:
         """
         Passa a un modello piu' leggero se questo non sta al passo.
 
-        Si interviene una volta sola e solo su misure abbondanti: e' un
-        cambiamento visibile all'utente e non deve avvenire per una
-        raffica passeggera. Se e' stato l'utente a scegliere il modello,
-        non si tocca nulla — si limita ad avvisare.
+        La via ordinaria decide su misure abbondanti, per non reagire a
+        una raffica passeggera. La via d'emergenza — chiamate che costano
+        piu' del doppio dell'audio che contengono — decide su due
+        conferme, perche' aspettarne otto significava decidere a
+        colloquio finito. Se e' stato l'utente a scegliere il modello,
+        non si tocca nulla: si avvisa, una volta sola e con un consiglio
+        concreto.
         """
-        if self._downgraded >= MAX_DOWNGRADES or self._speed_samples < (
-            OVERLOAD_MIN_CALLS
-        ):
+        if self._downgraded >= MAX_DOWNGRADES:
             return
-        if self.load <= OVERLOAD_RATIO:
-            return
+        if not emergenza:
+            if self._speed_samples < OVERLOAD_MIN_CALLS:
+                return
+            if self.load <= OVERLOAD_RATIO:
+                return
 
         try:
             posizione = MODEL_LADDER.index(self.model_size)
         except ValueError:
             return
-        if posizione + 1 >= len(MODEL_LADDER):
-            return
-        piu_leggero = MODEL_LADDER[posizione + 1]
 
-        # Si puo' scendere piu' di un gradino. Prima ci si fermava al
-        # primo, e su una macchina davvero lenta non bastava: nei log di
-        # un computer a due core il modello 'small' costava dieci secondi
-        # a frase, e anche 'base' sarebbe rimasto indietro. Dopo ogni
-        # cambio le misure ripartono da zero, quindi il gradino
-        # successivo viene deciso su dati nuovi, non su quelli vecchi.
-        self._downgraded += 1
+        from app.models.download import whisper_model_present
+
+        # Primo modello PRESENTE SUL DISCO scendendo la scala. Prima ci
+        # si fermava al gradino immediatamente sotto: se non era stato
+        # scaricato — e il programma scarica solo il modello selezionato —
+        # si rinunciava, dopo aver gia' speso il budget dei cambi. Il
+        # risultato era un meccanismo che sulla macchina che ne aveva
+        # piu' bisogno non poteva mai funzionare.
+        piu_leggero = next(
+            (m for m in MODEL_LADDER[posizione + 1:] if whisper_model_present(m)),
+            None,
+        )
+        consiglio = piu_leggero or (
+            MODEL_LADDER[posizione + 1] if posizione + 1 < len(MODEL_LADDER) else ""
+        )
+        if not consiglio:
+            return
 
         from app import settings
 
@@ -1390,10 +1502,7 @@ class TranscriptionEngine:
         # stata scavalcata in silenzio.
         if "whisper_model_size" in (settings.get("user_choices") or ()):
             self._downgraded = MAX_DOWNGRADES     # una volta sola, e basta
-            # Il consiglio deve essere concreto: quanto costa adesso una
-            # frase, e quale modello scegliere. "Prova un modello piu'
-            # leggero" non dice ne' quale ne' perche'.
-            self.suggested_model = piu_leggero
+            self.suggested_model = consiglio
             # Il tempo si cita solo se e' un numero che significa
             # qualcosa detto ad alta voce: "circa 0 secondi" farebbe
             # sembrare rotto l'avviso invece del computer.
@@ -1406,23 +1515,29 @@ class TranscriptionEngine:
                 f"Il modello '{self.model_size}' {quanto} su questo computer: "
                 f"i sottotitoli restano sempre piu' indietro. Lo hai scelto "
                 f"tu, quindi non lo cambio — ma dalle impostazioni conviene "
-                f"passare a '{piu_leggero}'."
+                f"passare a '{consiglio}'."
             )
             return
 
-        from app.models.download import whisper_model_present
-
-        if not whisper_model_present(piu_leggero):
+        if piu_leggero is None:
+            # Nessun modello di ripiego sul disco: si avvisa senza
+            # bruciare il budget dei cambi — se un modello leggero
+            # comparira', il meccanismo deve poter ancora agire.
+            self.suggested_model = consiglio
             self._notify_status(
                 f"Il modello '{self.model_size}' non sta al passo su questo "
-                "computer. Al termine del colloquio passa a un modello piu' "
-                "leggero dalle impostazioni."
+                f"computer e il modello '{consiglio}' non e' ancora "
+                "scaricato. Al termine del colloquio selezionalo dalle "
+                "impostazioni: verra' scaricato e usato dal prossimo "
+                "colloquio."
             )
+            self._downgraded = MAX_DOWNGRADES     # inutile riprovare ora
             return
 
         log.warning(
-            "Carico %.2f con il modello '%s': passo a '%s'",
-            self.load, self.model_size, piu_leggero,
+            "%s con il modello '%s': passo a '%s'",
+            "Emergenza" if emergenza else f"Carico {self.load:.2f}",
+            self.model_size, piu_leggero,
         )
         self._notify_status(
             f"Il modello '{self.model_size}' non riesce a stare al passo: "
@@ -1433,6 +1548,9 @@ class TranscriptionEngine:
             self._swap_model(piu_leggero)
         except Exception:
             log.exception("Cambio del modello non riuscito: proseguo con quello attuale")
+            return
+        # Il budget si spende solo quando il cambio avviene davvero.
+        self._downgraded += 1
 
     def _swap_model(self, nuovo: str) -> None:
         """
@@ -1448,19 +1566,37 @@ class TranscriptionEngine:
 
         from app.models.download import whisper_model_dir
 
+        vecchio = self.model_size
         self._model = None
         import gc
 
         gc.collect()
 
-        self.model_size = nuovo
-        self._model = WhisperModel(
-            str(whisper_model_dir(nuovo)),
-            device="cpu",
-            compute_type=config.WHISPER_COMPUTE_TYPE,
-            cpu_threads=config.transcription_threads(),
-            num_workers=1,
-        )
+        def _carica(size: str):
+            return WhisperModel(
+                str(whisper_model_dir(size)),
+                device="cpu",
+                compute_type=config.WHISPER_COMPUTE_TYPE,
+                cpu_threads=config.transcription_threads(),
+                num_workers=1,
+            )
+
+        try:
+            self._model = _carica(nuovo)
+            self.model_size = nuovo
+        except Exception:
+            # Il vecchio modello e' gia' stato lasciato andare: senza
+            # questo ripristino il motore restava SENZA ALCUN modello e
+            # scartava in silenzio ogni frase fino a fine colloquio, con
+            # i log che per giunta dichiaravano il nome del modello
+            # nuovo. Meglio lento che muto.
+            log.exception(
+                "Caricamento di '%s' fallito: ricarico '%s'", nuovo, vecchio
+            )
+            self._model = _carica(vecchio)
+            self.model_size = vecchio
+            raise
+
         self.model_changed_to = nuovo
         # Le misure precedenti riguardavano un altro modello.
         self._call_cost = 0.0
