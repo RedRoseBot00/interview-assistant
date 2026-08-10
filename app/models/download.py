@@ -555,6 +555,24 @@ def ensure_models_ready(
         log.info("Scarico il modello di trascrizione '%s'", whisper_size)
         download_whisper_model(whisper_size, on_progress, should_stop=should_stop)
     _check_stop(should_stop)
+    # Il paracadute. Quando il computer non sta al passo, il programma
+    # scende automaticamente verso un modello piu' leggero — ma puo'
+    # atterrare solo su un modello gia' scaricato, e prima si scaricava
+    # soltanto quello selezionato: sulla macchina lenta, cioe' proprio
+    # quella che ne aveva bisogno, il meccanismo non aveva mai nulla su
+    # cui atterrare. 'tiny' pesa meno di cento megabyte: e' l'unica
+    # assicurazione che il colloquio possa comunque essere trascritto.
+    if whisper_size != "tiny" and not whisper_model_present("tiny"):
+        try:
+            log.info("Scarico anche il modello 'tiny' come riserva")
+            download_whisper_model("tiny", on_progress, should_stop=should_stop)
+        except DownloadCancelled:
+            raise
+        except Exception:
+            # La riserva non deve mai bloccare l'avvio: senza, il
+            # programma funziona esattamente come prima.
+            log.warning("Modello di riserva non scaricato", exc_info=True)
+    _check_stop(should_stop)
     if not llm_model_present():
         log.info("Scarico il modello per i report")
         download_llm_model(on_progress, should_stop=should_stop)
