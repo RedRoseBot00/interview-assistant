@@ -65,6 +65,82 @@ class StartupWorker(QThread):
     def _stopped(self) -> bool:
         return self._cancel.is_set() or self.isInterruptionRequested()
 
+    def _apply_speed_tuning(self, call_seconds: float) -> str:
+        """
+        Sceglie il modello di partenza in base alla velocita' MISURATA.
+
+        Il controllo preventivo trascrive davvero un secondo di audio su
+        questo computer: quel cronometro dice piu' di qualunque
+        deduzione sull'architettura. Se il modello selezionato non regge
+        il ritmo di un dialogo, si parte gia' dal primo colloquio con
+        uno che lo regge, invece di accorgersene a colloquio in corso —
+        con le prime frasi in ritardo e il declassamento d'emergenza a
+        meta' della prima risposta.
+
+        Restituisce il messaggio da mostrare all'utente, o una stringa
+        vuota se non c'e' nulla da dire.
+        """
+        if call_seconds <= 0:
+            return ""
+        settings.set("engine_speed_seconds", round(call_seconds, 2))
+        log.info(
+            "Velocita' misurata: %.1f s a chiamata con il modello '%s'",
+            call_seconds, self.whisper_size,
+        )
+
+        ideale = diagnostics.modello_per_velocita(call_seconds, self.whisper_size)
+        if ideale == self.whisper_size:
+            return ""
+
+        # La scelta esplicita dell'utente non si tocca mai: si consiglia.
+        if "whisper_model_size" in (settings.get("user_choices") or ()):
+            return (
+                f"Questo computer impiega circa {call_seconds:.0f} secondi per "
+                f"trascrivere una frase con il modello '{self.whisper_size}': "
+                f"per stare al passo del parlato conviene scegliere "
+                f"'{ideale}' dalle impostazioni."
+            )
+
+        # Il modello ideale potrebbe non essere ancora sul disco: si
+        # prova a scaricarlo adesso, dentro la fase di preparazione che
+        # l'utente sta gia' guardando. Se non si riesce, si ripiega sul
+        # migliore fra quelli presenti — 'tiny' c'e' sempre, e' la
+        # riserva scaricata al primo avvio.
+        if not model_download.whisper_model_present(ideale):
+            try:
+                self.stage.emit(
+                    f"Questo computer richiede il modello '{ideale}': "
+                    "lo scarico ora..."
+                )
+                model_download.download_whisper_model(
+                    ideale,
+                    lambda name, done, total: self.progress.emit(name, done, total),
+                    should_stop=self._stopped,
+                )
+            except Exception:
+                log.warning("Modello '%s' non scaricato", ideale, exc_info=True)
+        if not model_download.whisper_model_present(ideale):
+            scala = ("medium", "small", "base", "tiny")
+            ideale = next(
+                (m for m in scala[scala.index(ideale):]
+                 if model_download.whisper_model_present(m)),
+                self.whisper_size,
+            )
+            if ideale == self.whisper_size:
+                return ""
+
+        settings.set("whisper_model_size", ideale)
+        log.info(
+            "Modello di partenza adattato alla velocita' misurata: '%s' -> '%s'",
+            self.whisper_size, ideale,
+        )
+        return (
+            f"Questo computer impiega circa {call_seconds:.0f} secondi per "
+            f"trascrivere una frase con il modello '{self.whisper_size}': "
+            f"per avere i sottotitoli al passo del parlato usero' "
+            f"'{ideale}'. Puoi cambiarlo quando vuoi dalle impostazioni."
+        )
+
     def run(self) -> None:  # noqa: D401 - metodo di QThread
         try:
             missing = model_download.missing_models(self.whisper_size)
@@ -133,6 +209,9 @@ class StartupWorker(QThread):
                         "non supporta le istruzioni piu' veloci, quindi la "
                         "trascrizione sara' piu' lenta ma stabile."
                     )
+                taratura = self._apply_speed_tuning(result.call_seconds)
+                if taratura:
+                    message = (message + " " + taratura).strip()
                 self.finished_ok.emit(result.compatible_mode, message)
             elif result.inconclusive:
                 # Il controllo non ha dato risposta: NON e' un guasto.

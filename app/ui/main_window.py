@@ -1435,6 +1435,12 @@ class MainWindow(QMainWindow):
             velocita = self.session.realtime_factor
             if velocita:
                 testo += f" — trascrizione a {velocita:.1f}× il tempo reale"
+            # L'arretrato va detto, non solo gestito: chi vede i
+            # sottotitoli arrivare tardi merita di sapere di quanto,
+            # invece di chiedersi se il programma sia rotto.
+            arretrato = self.session.pending_seconds
+            if arretrato >= 5.0:
+                testo += f" — sottotitoli in ritardo di {int(arretrato)} s"
             # Riscrivere l'etichetta solo quando cambia evita un
             # ridisegno al secondo, che su un computer modesto si nota.
             if testo != self._stats_cache:
