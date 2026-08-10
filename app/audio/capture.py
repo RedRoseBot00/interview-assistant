@@ -144,6 +144,12 @@ class AudioQueue(queue.Queue):
         # solo la punta dell'iceberg e non scattava mai: l'attesa reale
         # poteva superare i cinque minuti con il contatore quasi a zero.
         self.parked_seconds = 0.0
+        # Secondi di parlato buttati via perche' la trascrizione non
+        # stava al passo. E' il sensore di sovraccarico piu' onesto che
+        # esista: il carico stimato puo' ingannarsi — quando si scarta,
+        # il ritmo misurato degli arrivi e' quello dei sopravvissuti e
+        # sembra tutto in regola — ma il parlato perso non mente mai.
+        self.dropped_seconds = 0.0
 
     @property
     def pending_seconds(self) -> float:
@@ -193,6 +199,7 @@ class AudioQueue(queue.Queue):
                     trattenuti.append(elemento)
                     continue
                 self._queued_seconds = max(0.0, self._queued_seconds - durata)
+                self.dropped_seconds += durata
                 scartati += 1
             for elemento in reversed(trattenuti):
                 self.queue.appendleft(elemento)
