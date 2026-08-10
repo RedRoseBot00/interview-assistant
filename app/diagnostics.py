@@ -76,7 +76,22 @@ _STATUS_PRIVILEGED_INSTRUCTION = 0xC0000096
 
 
 def _is_native_crash(code: int) -> bool:
-    """True se il processo figlio e' stato ucciso dal sistema operativo."""
+    """
+    True se il figlio e' morto per un'ISTRUZIONE che il processore non
+    sa eseguire.
+
+    La violazione di accesso alla memoria e' stata tolta da questo
+    elenco, ed era il difetto piu' costoso del programma. E' il modo
+    piu' comune in cui un processo muore per ragioni che con le
+    istruzioni del processore non c'entrano nulla: memoria esaurita
+    mentre si carica il modello (su una macchina virtuale e' la
+    normalita'), un antivirus che si interpone, un file del modello
+    scaricato a meta'. In tutti quei casi il programma concludeva
+    "questo processore non supporta le istruzioni veloci", ripiegava sui
+    kernel generici — cinque volte piu' lenti — e SALVAVA quella
+    decisione: da li' in avanti, a ogni avvio, la trascrizione partiva
+    gia' condannata, e il controllo non veniva mai piu' ripetuto.
+    """
     if code == 0:
         return False
     if sys.platform == "win32":
@@ -85,12 +100,12 @@ def _is_native_crash(code: int) -> bool:
         unsigned = code & 0xFFFFFFFF
         return unsigned in (
             _STATUS_ILLEGAL_INSTRUCTION,
-            _STATUS_ACCESS_VIOLATION,
             _STATUS_PRIVILEGED_INSTRUCTION,
         )
-    # Su Unix un codice negativo e' il numero del segnale ricevuto
-    # (SIGILL = 4, SIGSEGV = 11).
-    return code in (-4, -11)
+    # Su Unix un codice negativo e' il numero del segnale ricevuto:
+    # SIGILL (4) e' l'istruzione illecita. SIGSEGV (11) e' l'equivalente
+    # della violazione di accesso, e per la stessa ragione non basta.
+    return code in (-4,)
 
 
 @dataclass
@@ -165,6 +180,16 @@ def _run_child(
         )
     except Exception as exc:  # pragma: no cover
         return EXIT_LAUNCH_FAILED, f"Impossibile eseguire il test di avvio: {exc}"
+
+    # Se il programma principale muore mentre il controllo e' in corso,
+    # questo processo va chiuso con lui invece di restare a caricare un
+    # modello che nessuno leggera' mai.
+    try:
+        from app import compat
+
+        compat.adotta_processo_figlio(proc)
+    except Exception:
+        log.debug("Figlio non associato al job object", exc_info=True)
 
     # L'uscita del figlio va SVUOTATA di continuo, in un thread a parte.
     # Sorvegliare il processo senza leggere il tubo sembra innocuo, ma

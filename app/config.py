@@ -11,7 +11,7 @@ from pathlib import Path
 
 APP_NAME = "InterviewAssistant"
 APP_DISPLAY_NAME = "Interview Assistant"
-APP_VERSION = "3.2.0"
+APP_VERSION = "3.3.0"
 
 # --------------------------------------------------------------------------
 # Percorsi applicazione
@@ -109,6 +109,12 @@ DECODE_TEMPERATURES_FAST = (0.0, 0.4)
 DECODE_BEAM_MIN = 1
 DECODE_BEAM_MID = 3
 DECODE_BEAM_MAX = 5
+# Quante trascrizioni alternative generare quando il primo tentativo
+# viene male e si riprova a temperatura piu' alta. Sul computer che non
+# sta al passo ne basta una: il tentativo di recupero resta, ma costa
+# una decodifica invece di cinque.
+DECODE_BEST_OF_MIN = 1
+DECODE_BEST_OF_MAX = 5
 # Soglie sul rapporto fra durata dell'audio e tempo impiegato, con
 # isteresi per non oscillare fra una configurazione e l'altra.
 SPEED_RAISE_QUALITY = 2.5
@@ -181,8 +187,11 @@ def _physical_cores() -> int:
 
 
 def llm_threads() -> int:
-    cores = _physical_cores()
-    return cores if cores <= 2 else cores - 1
+    # Stessa regola della trascrizione: mai tutta la macchina dove c'e'
+    # margine, tutta dove non ce n'e'. Il report si genera a colloquio
+    # finito, ma l'utente sta comunque guardando lo schermo e la
+    # finestra deve restare viva.
+    return transcription_threads()
 
 # --------------------------------------------------------------------------
 # Audio
@@ -247,13 +256,28 @@ def transcription_threads() -> int:
     """
     Thread da assegnare al riconoscimento vocale.
 
-    Su un computer con due core vanno usati entrambi, altrimenti la
-    trascrizione non sta al passo del parlato; da quattro core in su ne
-    lasciamo uno libero per l'interfaccia e per la cattura audio, che
-    devono restare reattive.
+    Su un computer senza scheda grafica dedicata — e su una macchina
+    virtuale sempre — l'anteprima della videochiamata non e' disegnata
+    dalla GPU ma composta dal processore, dal servizio grafico di
+    Windows. Saturando tutti i core quel servizio resta senza tempo di
+    calcolo: l'anteprima va a scatti, e con lei tutto il desktop.
+    Lasciarne uno libero e' quindi giusto — ma solo dove ce n'e' da
+    lasciare.
+
+    Su due core, togliere e' peggio del male: la trascrizione si ritrova
+    con un thread solo, cioe' meta' della macchina, e il calcolo del
+    riconoscimento vocale scala quasi linearmente con i core. Su una
+    macchina virtuale la cosa peggiorava ancora, perche' l'ipervisore
+    quasi mai dichiara i thread hardware: due processori virtuali
+    risultano due core "fisici", e la sottrazione lasciava un thread
+    solo dove ne servivano due. Da quattro core in su si lascia
+    respirare il sistema; sotto, si usa quello che c'e'.
     """
-    cores = _physical_cores()
-    return cores if cores <= 2 else cores - 1
+    fisici = _physical_cores()
+    if fisici >= 4:
+        return fisici - 1
+    logici = os.cpu_count() or 2
+    return max(1, min(logici, max(2, fisici)))
 
 # Etichette interne dei due canali audio
 SPEAKER_RECRUITER = "recruiter"   # microfono locale: chi conduce il colloquio

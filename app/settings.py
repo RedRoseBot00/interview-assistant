@@ -7,6 +7,7 @@ aggiornamenti.
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import threading
@@ -34,7 +35,8 @@ TUNING_REVISION = 4
 # programma lo riportava a "base" al primo avvio dopo un aggiornamento,
 # in silenzio. Per questo teniamo traccia delle scelte esplicite in
 # "user_choices" e quelle non si toccano.
-_AUTO_TUNED = ("whisper_model_size", "engine_selftest", "engine_selftest_size")
+_AUTO_TUNED = ("whisper_model_size", "engine_selftest", "engine_selftest_size",
+               "engine_selftest_fingerprint")
 
 
 def _default_model_size() -> str:
@@ -83,6 +85,11 @@ DEFAULTS: dict[str, Any] = {
     # Esito dell'ultimo test di avvio del motore di trascrizione
     "engine_selftest": "",  # "" | "ok" | "ok-compatible" | "failed"
     "engine_selftest_size": "",  # modello su cui il test e' stato eseguito
+    # Versione del programma, processore e modello su cui vale l'esito
+    # qui sopra. Prima si confrontava solo il modello: aggiornando il
+    # programma — e con lui le librerie di calcolo — si ereditava un
+    # verdetto preso su un'altra libreria.
+    "engine_selftest_fingerprint": "",
     # Interfaccia
     "always_on_top": False,
     # Uso interno: vedi TUNING_REVISION.
@@ -152,9 +159,17 @@ def load() -> dict[str, Any]:
     global _cache
     with _lock:
         if _cache is not None:
-            return dict(_cache)
+            # Copia PROFONDA anche qui: dict() lascerebbe la lista
+            # user_choices condivisa con la cache, e chi la mutasse
+            # sporcherebbe le impostazioni per tutto il processo.
+            return copy.deepcopy(_cache)
 
-        data = dict(DEFAULTS)
+        # Copia PROFONDA: dict() e' superficiale, quindi la lista
+        # user_choices restava lo stesso identico oggetto dei valori
+        # predefiniti e finiva in mano ai chiamanti. Bastava che uno di
+        # loro ci aggiungesse una voce per contaminare i predefiniti per
+        # tutta la vita del processo, reset() compreso.
+        data = copy.deepcopy(DEFAULTS)
         path = _path()
         if path.exists():
             try:
@@ -191,6 +206,9 @@ def load() -> dict[str, Any]:
             # cambiato, il test precedente non dice piu' nulla.
             data["engine_selftest"] = DEFAULTS["engine_selftest"]
             data["engine_selftest_size"] = DEFAULTS["engine_selftest_size"]
+            data["engine_selftest_fingerprint"] = DEFAULTS[
+                "engine_selftest_fingerprint"
+            ]
             data["tuning_revision"] = TUNING_REVISION
             log.info(
                 "Taratura automatica aggiornata alla revisione %s: "
@@ -199,10 +217,10 @@ def load() -> dict[str, Any]:
             )
             _cache = data
             _write(data)
-            return dict(data)
+            return copy.deepcopy(data)
 
         _cache = data
-        return dict(data)
+        return copy.deepcopy(data)
 
 
 def get(key: str, default: Any = None) -> Any:
@@ -274,7 +292,7 @@ def _write(data: dict[str, Any]) -> None:
 def reset() -> None:
     global _cache
     with _lock:
-        _cache = dict(DEFAULTS)
+        _cache = copy.deepcopy(DEFAULTS)
         try:
             _path().unlink(missing_ok=True)
         except Exception:

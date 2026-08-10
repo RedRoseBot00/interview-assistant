@@ -25,9 +25,12 @@ faster_whisper / ctranslate2, altrimenti la variabile viene ignorata.
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 import platform
 import sys
+
+log = logging.getLogger(__name__)
 
 # Costanti IMAGE_FILE_MACHINE_* dell'API Windows
 _MACHINE_NAMES = {
@@ -106,6 +109,78 @@ def cpu_supports_avx2() -> bool:
         return True
 
 
+_job_handle = None
+
+
+def adotta_processo_figlio(proc) -> None:
+    """
+    Fa in modo che Windows chiuda i processi figli insieme al nostro.
+
+    Il programma avvia processi separati per il controllo preventivo e
+    per scrivere il report: quest'ultimo occupa due gigabyte di memoria
+    e tutti i core per diversi minuti. Se l'applicazione principale
+    muore — chiusa da Gestione attivita', fermata da un antivirus, o per
+    un guasto — quel processo continuava a girare da solo, senza
+    finestra e senza voce nella barra delle applicazioni: il computer
+    restava lentissimo e nessuno capiva perche'.
+
+    Un "job object" con la chiusura a cascata risolve la cosa alla
+    radice, ed e' il sistema operativo a farsene carico.
+    """
+    global _job_handle
+    if sys.platform != "win32" or proc is None:
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        if _job_handle is None:
+            class _LimitiBase(ctypes.Structure):
+                _fields_ = [
+                    ("PerProcessUserTimeLimit", ctypes.c_int64),
+                    ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", wintypes.DWORD),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t),
+                    ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t),
+                    ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD),
+                ]
+
+            class _LimitiEstesi(ctypes.Structure):
+                _fields_ = [
+                    ("BasicLimitInformation", _LimitiBase),
+                    ("IoInfo", ctypes.c_ubyte * 48),
+                    ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t),
+                ]
+
+            handle = kernel32.CreateJobObjectW(None, None)
+            if not handle:
+                return
+            info = _LimitiEstesi()
+            # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            info.BasicLimitInformation.LimitFlags = 0x00002000
+            # JobObjectExtendedLimitInformation = 9
+            if not kernel32.SetInformationJobObject(
+                handle, 9, ctypes.byref(info), ctypes.sizeof(info)
+            ):
+                kernel32.CloseHandle(handle)
+                return
+            _job_handle = handle
+
+        kernel32.AssignProcessToJobObject(_job_handle, int(proc._handle))
+    except Exception:
+        # Non e' una funzione indispensabile: se non riesce, il figlio
+        # resta semplicemente indipendente come prima.
+        log.debug("Processo figlio non associato al job object", exc_info=True)
+
+
 def describe_cpu() -> str:
     """Riga descrittiva usata nei log e nella schermata diagnostica."""
     parts = [
@@ -147,9 +222,25 @@ def apply_cpu_compat(force_generic: bool | None = None) -> bool:
     # una variabile d'ambiente globale puo' solo contraddirli.
     os.environ.pop("OMP_NUM_THREADS", None)
 
+    # Finita una frase, i thread di calcolo per impostazione predefinita
+    # non si addormentano: restano ad aspettare girando a vuoto per
+    # essere pronti alla frase successiva. Su un computer potente e'
+    # un buon compromesso; su due core e' un disastro, perche' quel
+    # tempo bruciato a vuoto e' esattamente quello che serve al servizio
+    # grafico di Windows per comporre l'anteprima della videochiamata —
+    # che su una macchina virtuale disegna con il processore. Chiediamo
+    # quindi di mettersi a dormire subito.
+    os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+    os.environ.setdefault("GOMP_SPINCOUNT", "0")
+    os.environ.setdefault("KMP_BLOCKTIME", "0")
+
     # CTranslate2 e tokenizers producono log rumorosi su stderr che, in
     # una app senza console, finirebbero nel nulla o darebbero fastidio.
-    os.environ.setdefault("CT2_VERBOSE", "0")
+    # Il livello 1 aggiunge cinque righe per avvio che dicono quale set
+    # di istruzioni e quale precisione siano stati scelti davvero: senza
+    # di esse non c'e' modo di sapere se il computer stia usando i
+    # kernel veloci o quelli generici, che costano cinque volte tanto.
+    os.environ.setdefault("CT2_VERBOSE", "1")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     # Evita che HuggingFace apra thread di telemetria non necessari.
     os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
