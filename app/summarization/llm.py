@@ -54,36 +54,35 @@ LANGUAGE_NAMES = {
     "ja": "giapponese",
 }
 
+# Ogni token di questo testo viene LETTO a ogni report, e ogni token
+# del report viene SCRITTO a ~4 token al secondo su un computer a due
+# core: la brevita' qui sotto non e' stile, e' tempo d'attesa
+# dell'utente. Il vecchio formato produceva ~310 token di report; questo
+# ne produce ~170 con le stesse sei sezioni.
 SYSTEM_PROMPT = (
-    "Sei un assistente professionale per selezionatori del personale. "
-    "Sei preciso, sintetico e non inventi mai informazioni: se un dato non "
-    "compare nella trascrizione, scrivi che non e' emerso."
+    "Assistente per selezionatori: preciso, sintetico, non inventa "
+    "nulla. Un dato assente e' 'non emerso'."
 )
 
-PROMPT_TEMPLATE = """Di seguito la trascrizione automatica di un colloquio di \
-lavoro appena concluso. Le battute sono attribuite a chi le ha pronunciate; \
-la trascrizione puo' contenere piccoli errori di riconoscimento vocale.
+PROMPT_TEMPLATE = """Trascrizione automatica di un colloquio di lavoro \
+(possibili errori di riconoscimento vocale).
 
-Candidato: {candidate_name}
-Posizione: {role}
-Durata: {duration}
+Candidato: {candidate_name} — Posizione: {role} — Durata: {duration}
 
 --- TRASCRIZIONE ---
 {transcript}
---- FINE TRASCRIZIONE ---
+--- FINE ---
 
-Scrivi un resoconto in {output_language} con queste sezioni numerate:
+Scrivi in {output_language}, righe brevi, senza premesse ne' commenti:
 
-1. SINTESI — 3 frasi
-2. PUNTI DI FORZA — massimo 4 punti elenco, una riga ciascuno
-3. AREE DI ATTENZIONE — massimo 3 punti elenco, una riga ciascuno
-4. COMPETENZE CITATE — solo un elenco di parole chiave
-5. DOMANDE DI APPROFONDIMENTO — massimo 3
-6. VALUTAZIONE — Positiva, Da approfondire oppure Negativa, con una riga \
-di motivazione
+1. SINTESI — 2 frasi
+2. PUNTI DI FORZA — massimo 3, una riga ciascuno
+3. AREE DI ATTENZIONE — massimo 2, una riga ciascuna
+4. COMPETENZE CITATE — solo parole chiave
+5. DOMANDE DI APPROFONDIMENTO — massimo 2
+6. VALUTAZIONE — Positiva, Da approfondire o Negativa + una riga
 
-Sii asciutto e concreto: niente premesse, niente ripetizioni, nessun \
-commento sul tuo lavoro. Basati esclusivamente sulla trascrizione."""
+Solo cio' che compare nella trascrizione; un dato assente e' "non emerso"."""
 
 
 @dataclass
@@ -181,7 +180,13 @@ def truncate_transcript(
     risultato supererebbe sempre il limite dichiarato.
     """
     if max_chars is None:
-        max_chars = config.LLM_MAX_TRANSCRIPT_CHARS
+        # Su due core la lettura del testo pesa quanto la scrittura del
+        # report: si consegna una trascrizione un po' piu' corta.
+        max_chars = (
+            config.LLM_MAX_TRANSCRIPT_CHARS_SLOW
+            if config._physical_cores() <= 2
+            else config.LLM_MAX_TRANSCRIPT_CHARS
+        )
     text = transcript.strip()
     if len(text) <= max_chars:
         return text, False
@@ -820,7 +825,11 @@ def generate_report_child(input_path: str, output_path: str) -> int:
             model_path=payload["model_path"],
             n_ctx=contesto,
             n_threads=threads,
-            n_threads_batch=threads,
+            # La LETTURA del prompt satura le unita' di calcolo e con i
+            # thread hardware in piu' guadagna un dieci per cento; la
+            # scrittura invece e' limitata dalla memoria e resta sui
+            # core fisici. Due valori diversi, di proposito.
+            n_threads_batch=max(threads, os.cpu_count() or threads),
             n_batch=batch,
             verbose=False,
         )
