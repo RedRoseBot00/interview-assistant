@@ -171,7 +171,6 @@ def _run_smoke_test() -> int:
         "PySide6.QtWidgets",
         "faster_whisper",
         "ctranslate2",
-        "onnxruntime",
         "llama_cpp",
         "av",
     )

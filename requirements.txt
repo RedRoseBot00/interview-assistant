@@ -17,8 +17,8 @@ tokenizers==0.19.1
 huggingface-hub==0.24.6
 tqdm==4.66.5
 
-# Rilevamento della voce, usato per scartare i silenzi
-onnxruntime==1.18.1
+# Il rilevamento della voce e' scritto in casa (app/audio/vad.py): non
+# serve onnxruntime, che pesava diciassette megabyte nell'installer.
 
 # Modello linguistico locale per i report (nessuna API, nessun costo)
 llama-cpp-python==0.2.90
