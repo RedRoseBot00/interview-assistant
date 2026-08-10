@@ -115,6 +115,10 @@ FAST_OVERLOAD_FACTOR = 2.5
 ENCODER_WINDOW_FULL = 30
 ENCODER_WINDOW_MIN = 10
 
+# Secondi di parlato perso oltre i quali si tenta l'alleggerimento
+# d'emergenza, qualunque cosa dica il carico stimato.
+DROP_ALARM_SECONDS = 3.0
+
 # Ogni quante frasi lunghe si lascia il modello libero di ridire la sua
 # sulla lingua, per potersi ricredere su un blocco iniziale sbagliato.
 LANGUAGE_PROBE_EVERY = 8
@@ -364,6 +368,9 @@ class TranscriptionEngine:
         # Blocchi abbandonati perche' l'arretrato era troppo grande al
         # momento dell'arresto: vanno detti all'utente, non nascosti.
         self.dropped_on_stop = 0
+        # Secondi di parlato gia' visti scartare dalla coda: serve a
+        # reagire solo agli scarti NUOVI.
+        self._dropped_seen = 0.0
         self.merged_utterances = 0
 
         # Conteggi aggiornati man mano. Ricalcolarli ogni secondo
@@ -650,6 +657,21 @@ class TranscriptionEngine:
                 log.exception("Errore durante l'elaborazione di un blocco")
                 self._notify_error(exc)
             self._update_parked(audio_queue)
+
+            # Parlato buttato via dalla coda: prova DEFINITIVA di
+            # sovraccarico. Il carico stimato qui si inganna da solo —
+            # quando si scarta, il ritmo misurato e' quello dei blocchi
+            # sopravvissuti e sembra tutto in regola — quindi il
+            # regolatore ordinario non scattava mai proprio mentre si
+            # perdeva parlato. Il parlato perso invece non mente.
+            scarti = float(getattr(audio_queue, "dropped_seconds", 0.0) or 0.0)
+            if scarti - self._dropped_seen >= DROP_ALARM_SECONDS:
+                self._dropped_seen = scarti
+                log.warning(
+                    "Persi %.0f s di parlato per sovraccarico: provo ad "
+                    "alleggerire", scarti,
+                )
+                self._consider_lighter_model(emergenza=True)
 
         # Lo svuotamento finale va protetto quanto il resto: e' il
         # momento in cui escono le ultime frasi del colloquio, e un
