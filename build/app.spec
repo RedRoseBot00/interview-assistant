@@ -7,8 +7,8 @@
 #
 # Produce una build "onedir": una cartella con l'eseguibile e le
 # librerie. E' piu' affidabile della modalita' a file singolo quando
-# sono coinvolti binari nativi pesanti (CTranslate2, llama.cpp,
-# onnxruntime). L'utente finale non vede comunque questa cartella:
+# sono coinvolti binari nativi pesanti (CTranslate2, llama.cpp).
+# L'utente finale non vede comunque questa cartella:
 # riceve un unico file di installazione creato con Inno Setup, che la
 # installa come qualunque altro programma Windows.
 
@@ -39,7 +39,13 @@ hiddenimports = []
 PACCHETTI_OBBLIGATORI = (
     "faster_whisper",
     "ctranslate2",
-    "onnxruntime",
+    # onnxruntime NON va incluso. Serviva al rilevatore di voce di
+    # faster-whisper, che qui non viene mai usato: il rilevamento e'
+    # scritto in casa (app/audio/vad.py) e la trascrizione passa
+    # vad_filter=False. Erano diciassette megabyte nell'installer, piu'
+    # un paio di centinaia di moduli che tirano dentro torch e
+    # transformers e riempiono di falsi allarmi il registro della
+    # compilazione, nascondendo quelli veri.
     "tokenizers",
     "llama_cpp",
     "av",
@@ -95,12 +101,9 @@ hiddenimports += [
     # Dipendenze di faster-whisper che non si individuano leggendo il codice.
     "huggingface_hub",
     "tqdm",
-    # Dipendenze di llama_cpp e onnxruntime.
+    # Dipendenze di llama_cpp.
     "diskcache",
     "jinja2",
-    "coloredlogs",
-    "humanfriendly",
-    "flatbuffers",
     "packaging",
     "psutil",
     "requests",
@@ -198,7 +201,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     # La compressione UPX agisce anche sulle DLL native e in passato ha
-    # causato chiusure improvvise con onnxruntime e CTranslate2:
+    # causato chiusure improvvise con CTranslate2:
     # preferiamo un pacchetto piu' grande ma affidabile.
     upx=False,
     console=False,  # nessuna finestra nera: solo interfaccia grafica
