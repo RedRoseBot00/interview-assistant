@@ -24,7 +24,7 @@ log = logging.getLogger(__name__)
 # porta dietro il valore salvato dalla versione precedente, e senza
 # questo meccanismo continuerebbe a usare per sempre una taratura che
 # nel frattempo abbiamo scoperto essere sbagliata.
-TUNING_REVISION = 4
+TUNING_REVISION = 5
 
 # Impostazioni scelte dal programma, non dall'utente: sono quelle che
 # il cambio di revisione azzera.
@@ -49,15 +49,26 @@ def _default_model_size() -> str:
     programma che deve funzionare in qualunque lingua non puo' partire
     dal modello che in diverse di esse non capisce.
 
-    'small' resta quindi il predefinito ovunque ci sia almeno un paio
-    di core veri; 'base' solo dove non c'e' alternativa. La velocita' se
-    ne occupa da sola: la profondita' della ricerca si adatta a quanto
-    il computer riesce a stare al passo (vedi engine._decoding_quality).
+    Resta pero' il fatto che Whisper elabora sempre una finestra di
+    trenta secondi: il costo e' PER CHIAMATA, e in un colloquio le
+    chiamate sono una per battuta, circa venti al minuto. Su un computer
+    a due core misurati sul campo, 'small' costa dieci secondi a frase:
+    il ritardo non si stabilizza mai, cresce per tutta la durata del
+    colloquio, e alla fine mancano dal report le frasi non elaborate.
+    Non e' un modello impreciso, e' un modello che non arriva.
+
+    Quindi: 'small' da quattro core in su, dove sta comodamente al
+    passo; 'base' sui due o tre core; 'tiny' dove c'e' un core solo.
+    Chi vuole di piu' puo' sempre alzarlo dalle impostazioni, e quella
+    scelta non viene mai scavalcata.
 
     Il conteggio va fatto sui core FISICI: un portatile a due core con
     SMT ne dichiara quattro.
     """
-    return "base" if config._physical_cores() < 2 else "small"
+    fisici = config._physical_cores()
+    if fisici >= 4:
+        return "small"
+    return "base" if fisici >= 2 else "tiny"
 
 
 DEFAULTS: dict[str, Any] = {
