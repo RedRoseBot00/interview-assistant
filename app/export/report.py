@@ -8,6 +8,7 @@ impaginazione aggiuntiva solo per questo.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -49,6 +50,17 @@ def _unique_path(directory: Path, base: str, suffix: str) -> Path:
     return path
 
 
+# Word rifiuta i caratteri di controllo ("All strings must be XML
+# compatible"): un byte spurio nel report del modello linguistico o
+# nella trascrizione rendeva l'INTERO colloquio inesportabile, con un
+# errore incomprensibile. Si ripuliscono tutte le stringhe in uscita.
+_XML_ILLEGALI = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _pulisci(testo) -> str:
+    return _XML_ILLEGALI.sub(" ", str(testo or ""))
+
+
 def _format_duration(seconds: float) -> str:
     seconds = max(0, int(seconds or 0))
     minutes, secs = divmod(seconds, 60)
@@ -57,9 +69,13 @@ def _format_duration(seconds: float) -> str:
 
 def _transcript_lines(interview: Interview, labels: dict[str, str]) -> list[str]:
     if interview.segments:
+        # Un elemento malformato (archivio toccato a mano, riga corrotta)
+        # non deve rendere inesportabile l'intero colloquio.
         return [
-            f"{labels.get(seg.get('speaker', ''), seg.get('speaker', ''))}: {seg.get('text', '')}"
+            f"{labels.get(seg.get('speaker', ''), seg.get('speaker', ''))}: "
+            f"{seg.get('text') or ''}"
             for seg in interview.segments
+            if isinstance(seg, dict)
         ]
     return (interview.transcript or "").splitlines()
 
@@ -112,23 +128,23 @@ def export_docx(
     path = _unique_path(directory, _base_name(interview), ".docx")
 
     document = Document()
-    document.add_heading(f"Colloquio - {interview.candidate_name}", level=0)
+    document.add_heading(_pulisci(f"Colloquio - {interview.candidate_name}"), level=0)
 
     meta = document.add_paragraph()
     meta.add_run("Posizione: ").bold = True
-    meta.add_run(f"{interview.role or 'non indicata'}\n")
+    meta.add_run(_pulisci(interview.role or "non indicata") + "\n")
     meta.add_run("Data: ").bold = True
     meta.add_run(f"{interview.display_date}\n")
     meta.add_run("Durata: ").bold = True
     meta.add_run(f"{_format_duration(interview.duration_seconds)}\n")
     meta.add_run("Lingua rilevata: ").bold = True
-    meta.add_run(interview.detected_language or "non rilevata")
+    meta.add_run(_pulisci(interview.detected_language or "non rilevata"))
     if interview.experience:
         meta.add_run("\nEsperienza: ").bold = True
-        meta.add_run(interview.experience)
+        meta.add_run(_pulisci(interview.experience))
     if interview.skills:
         meta.add_run("\nCompetenze: ").bold = True
-        meta.add_run(interview.skills)
+        meta.add_run(_pulisci(interview.skills))
 
     document.add_heading("Report", level=1)
     if not interview.used_llm and interview.report:
@@ -140,13 +156,13 @@ def export_docx(
             run.font.color.rgb = RGBColor(0x88, 0x88, 0x88)
     for block in (interview.report or "").split("\n"):
         if block.strip():
-            document.add_paragraph(block.strip())
+            document.add_paragraph(_pulisci(block.strip()))
 
     if interview.notes:
         document.add_heading("Note", level=1)
         for block in interview.notes.split("\n"):
             if block.strip():
-                document.add_paragraph(block.strip(), style="List Bullet")
+                document.add_paragraph(_pulisci(block.strip()), style="List Bullet")
 
     document.add_heading("Trascrizione completa", level=1)
     for line in _transcript_lines(interview, labels):
@@ -156,14 +172,14 @@ def export_docx(
         if ":" not in line:
             # Riga senza interlocutore (trascrizione di una versione
             # precedente): va riportata cosi' com'e'.
-            plain = paragraph.add_run(line.strip())
+            plain = paragraph.add_run(_pulisci(line.strip()))
             plain.font.size = Pt(9)
             continue
         speaker, _, text = line.partition(":")
-        run = paragraph.add_run(f"{speaker}: ")
+        run = paragraph.add_run(_pulisci(f"{speaker}: "))
         run.bold = True
         run.font.size = Pt(9)
-        body = paragraph.add_run(text.strip())
+        body = paragraph.add_run(_pulisci(text.strip()))
         body.font.size = Pt(9)
 
     document.save(str(path))
